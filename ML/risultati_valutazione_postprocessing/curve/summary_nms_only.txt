@@ -1,0 +1,17 @@
+curve_points_evaluated: 603
+best_metric: F1
+selection_mode: nms_only_fixed_ml_gt_0_50
+best_technique: nms
+best_threshold: 0.500000
+best_precision: 0.519380
+best_recall: 0.804000
+best_F1: 0.631083
+best_F2: 0.724585
+operating_metrics_png: 
+operating_metrics_csv: /Users/vincenzosauzullo/Desktop/Bone_Fracture_Detection/ML/risultati_valutazione_postprocessing/curve/operating_metrics_nms_only.csv
+OPERATING_PRECISION_nms: 0.519380
+OPERATING_RECALL_nms: 0.804000
+OPERATING_F1_nms: 0.631083
+AREA_PR_THRESHOLD_SWEEP_nms: 0.704531
+AVERAGE_PRECISION_DETECTION_FILE_nms: 0.704531
+FROC_SENS_AT_1FPPI_nms: 0.864000

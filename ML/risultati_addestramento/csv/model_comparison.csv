@@ -1,0 +1,2 @@
+experiment,classifier,feature_set,normalization,pca,feature_count,val_F2,val_precision,val_recall,val_F1,val_ROC_AUC,val_PR_AP,val_accuracy,test_precision,test_recall,test_F1,test_F2,test_ROC_AUC,test_PR_AP,test_accuracy,threshold,error,rank,selected
+texture_score__standard__SVM_RBF,SVM_RBF,texture_score,standard,yes,4626,0.740627,0.482966,0.85461,0.617157,0.931331,0.621353,0.883748,0.4846,0.858182,0.619423,0.743541,0.933173,0.695436,0.880462,0.435441,,1,BEST

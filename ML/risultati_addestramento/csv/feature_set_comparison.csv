@@ -1,0 +1,2 @@
+feature_set,best_experiment,best_classifier,best_normalization,feature_count,best_val_F2,best_val_precision,best_val_recall,best_val_F1,best_test_precision,best_test_recall,best_test_F1,best_test_PR_AP
+texture_score,texture_score__standard__SVM_RBF,SVM_RBF,standard,4626,0.740627,0.482966,0.85461,0.617157,0.4846,0.858182,0.619423,0.695436

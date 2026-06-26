@@ -1,0 +1,1844 @@
+// ============================================================================
+// fracture_detection.cpp
+// Pipeline completa per il rilevamento di fratture ossee su radiografie
+// pediatriche del polso (GRAZPEDWR-DX).
+//
+// METODOLOGIE INTEGRATE (da slide corso IPA/AIA - prof. A. Bria):
+//   Stage 0  - CLAHE (Mod.3 sl.37) + Bilateral Filter (Mod.4 sl.54)
+//   Stage 1  - Otsu (Mod.5 sl.9) + Morph. Open/Close (Mod.5/6) + CCA (Mod.5)
+//              + Border Extraction corticale (Mod.5 sl.52)
+//   Stage 2A - Morphological Gradient (Mod.6 sl.15)       [isotropico]
+//   Stage 2B - Top-hat multi-orientazione (Mod.6 sl.17)   [strutture lineari]
+//   Stage 2C - Gabor Filter Bank (Mod.8 sl.124)           [freq+orientazione]
+//   Stage 2D - GLCM Contrast locale (Mod.8 sl.55)         [anomalia texture]
+//   Stage 3  - Weighted Fusion delle 4 mappe
+//   Stage 4  - Marker-controlled Watershed (Mod.7 sl.40)
+//   Post     - Alternating Sequential Filtering (Mod.6 sl.13)
+// ============================================================================
+
+#include "ipaConfig.h"
+#include "ucasConfig.h"
+#include "ucasImageUtils.h"
+#include "ucasMathUtils.h"
+#include "ucasLog.h"
+#include "ucasTypes.h"
+#include "ucasStringUtils.h"
+
+#include <opencv2/imgproc/imgproc.hpp>
+#include <opencv2/imgcodecs.hpp>
+#include <opencv2/highgui/highgui.hpp>
+
+#include <iostream>
+#include <vector>
+#include <algorithm>
+#include <cmath>
+#include <cfloat>
+#include <string>
+#include <sstream>
+#include <cstdio>
+#include <fstream>
+#include <numeric>
+
+// ============================================================================
+// STRUTTURE DATI
+// ============================================================================
+
+struct Fracture
+{
+    int         regionId;
+    std::string method;
+    cv::Point   location;
+    double      score;
+    double      directionChange;
+    cv::Rect    box;
+
+    Fracture()
+        : regionId(0), method(""), location(0, 0),
+          score(0.0), directionChange(0.0), box() {}
+};
+
+struct InternalGradientDebug
+{
+    int       id;
+    cv::Rect  roi;
+    cv::Point center;
+
+    // features originali
+    double meanGray, stdGray, minGray, maxGray;
+    double meanGradient, stdGradient, maxGradient;
+    double darkDifference;
+
+    // NEW: mappe aggiuntive per fusione
+    double morphGradMean;   // Stage 2A
+    double topHatMean;      // Stage 2B
+    double gaborMean;       // Stage 2C
+    double glcmContrast;    // Stage 2D
+    double fusedScore;      // Stage 3
+
+    bool possibleFracture;
+
+    InternalGradientDebug()
+        : id(0), roi(), center(0, 0),
+          meanGray(0), stdGray(0), minGray(0), maxGray(0),
+          meanGradient(0), stdGradient(0), maxGradient(0),
+          darkDifference(0),
+          morphGradMean(0), topHatMean(0), gaborMean(0),
+          glcmContrast(0), fusedScore(0),
+          possibleFracture(false) {}
+};
+
+struct FractureCluster
+{
+    std::vector<Fracture> items;
+};
+
+struct ClusterRepresentative
+{
+    Fracture fracture;
+    double   clusterScore;
+    int      clusterSize;
+
+    ClusterRepresentative()
+        : fracture(), clusterScore(0.0), clusterSize(0) {}
+};
+
+struct InternalAdaptiveThresholds
+{
+    double meanGray;
+    double meanGradient;
+    double stdGradient;
+    double maxGradient;
+    double stdGray;
+    double darkDifference;
+    double fusedScoreThreshold;  // NEW
+
+    InternalAdaptiveThresholds()
+        : meanGray(0), meanGradient(0), stdGradient(0),
+          maxGradient(0), stdGray(0), darkDifference(0),
+          fusedScoreThreshold(0) {}
+};
+
+struct InternalDecisionDebug
+{
+    bool passMeanGray;
+    bool passMeanGradient;
+    bool passStdGradient;
+    bool passMaxGradient;
+    bool passStdGray;
+    bool passDarkDifference;
+    bool passFusedScore;    // NEW
+    int  strongTests;
+    bool veryStrongGradient;
+    bool balancedStrong;
+    bool possibleFracture;
+
+    InternalDecisionDebug()
+        : passMeanGray(false), passMeanGradient(false),
+          passStdGradient(false), passMaxGradient(false),
+          passStdGray(false), passDarkDifference(false),
+          passFusedScore(false),
+          strongTests(0), veryStrongGradient(false),
+          balancedStrong(false), possibleFracture(false) {}
+};
+
+struct GroundTruthBox
+{
+    int      classId;
+    cv::Rect box;
+    bool     matched;
+
+    GroundTruthBox()
+        : classId(-1), box(), matched(false) {}
+};
+
+struct IoUEvaluation
+{
+    int    truePositive;
+    int    falsePositive;
+    int    falseNegative;
+    double precision;
+    double recall;
+    double f1;
+
+    IoUEvaluation()
+        : truePositive(0), falsePositive(0), falseNegative(0),
+          precision(0), recall(0), f1(0) {}
+};
+
+// ============================================================================
+// PARAMETRI COMUNI
+// ============================================================================
+
+static int    MIN_CONTOUR_SIZE                        = 40;
+static int    EXTERNAL_MIN_DISTANCE_BETWEEN_FRACTURES = 100;
+static int    INTERNAL_MIN_DISTANCE_BETWEEN_FRACTURES = 90;
+static int    CLUSTER_RADIUS                          = 90;
+static double CLUSTER_SCORE_WEIGHT                    = 0.70;
+static double CLUSTER_CENTRALITY_WEIGHT               = 0.20;
+static double CLUSTER_LOCAL_SUPPORT_WEIGHT            = 0.10;
+static int    FRACTURE_BOX_RADIUS_X                   = 61;
+static int    FRACTURE_BOX_RADIUS_Y                   = 50;
+static int    MAX_FRACTURES_TO_SHOW                   = 100;
+static double CLAHE_CLIP                              = 0.1;
+static int    BONE_OFFSET                             = 25;
+static int    BONE_OPEN_SIZE                          = 11;
+static int    BONE_CLOSE_SIZE                         = 11;
+static int    CANNY_LOW                               = 0;
+static int    CANNY_HIGH                              = 255;
+static double IOU_THRESHOLD                           = 0.50;
+static std::string LABELS_DIR =
+    "C:/Users/Daniela/Desktop/universita(magistrale)/image_processing/"
+    "ProgettoIPA/Progetto_Bone_Fracture_Detection/"
+    "Bone_Fracture_Detection/images/label";
+
+// parametri metodo esterno
+static int    CONTOUR_SAMPLE_DIVISOR        = 700;
+static int    DIRECTION_OFFSET              = 22;
+static double DIRECTION_CHANGE_THRESHOLD    = 20.0;
+static int    EDGE_COUNT_THRESHOLD          = 30;
+static int    EDGE_ROI_RADIUS               = 22;
+static double EDGE_DENSITY_THRESHOLD        = 0.012;
+static int    BORDER_MARGIN                 = 20;
+static double IGNORE_TOP_RATIO              = 0.30;
+static double IGNORE_BOTTOM_RATIO           = 0.20;
+
+// parametri display
+static double DISPLAY_CLAHE_CLIP            = 2.5;
+static int    DISPLAY_CLAHE_TILE            = 8;
+static double UNSHARP_AMOUNT               = 1.4;
+static double UNSHARP_BLUR_SIGMA           = 1.2;
+
+// parametri metodo interno base
+static int    INTERNAL_MARGIN_FROM_CONTOUR          = 7;
+static int    INTERNAL_SCAN_STEP                    = 10;
+static int    INTERNAL_ROI_RADIUS                   = 83;
+static int    INTERNAL_MIN_MASK_PIXELS              = 180;
+static double INTERNAL_MEAN_GRAY_MIN_THRESHOLD      = 110.0;
+static double INTERNAL_GRADIENT_MEAN_MIN_THRESHOLD  = 520.0;
+static double INTERNAL_GRADIENT_STD_MIN_THRESHOLD   = 250.0;
+static double INTERNAL_GRADIENT_PEAK_MIN_THRESHOLD  = 1500.0;
+static double INTERNAL_GRAY_STD_MIN_THRESHOLD       = 22.0;
+static double INTERNAL_DARK_LINE_MIN_THRESHOLD      = 50.0;
+static double ADAPTIVE_MEAN_GRADIENT_PERCENTILE     = 0.88;
+static double ADAPTIVE_STD_GRADIENT_PERCENTILE      = 0.33;
+static double ADAPTIVE_MAX_GRADIENT_PERCENTILE      = 0.90;
+static double ADAPTIVE_GRAY_STD_PERCENTILE          = 0.62;
+static double ADAPTIVE_DARK_DIFF_PERCENTILE         = 0.50;
+static double INTERNAL_GRADIENT_MEAN_MAX_THRESHOLD  = 670.0;
+static double INTERNAL_GRADIENT_STD_MAX_THRESHOLD   = 430.0;
+static double INTERNAL_GRADIENT_PEAK_MAX_THRESHOLD  = 3000.0;
+static double INTERNAL_GRAY_STD_MAX_THRESHOLD       = 38.0;
+static double INTERNAL_DARK_LINE_MAX_THRESHOLD      = 95.0;
+static int    INTERNAL_MIN_STRONG_TESTS             = 4;
+static double INTERNAL_GRADIENT_BLUR_SIGMA          = 0.64;
+static double LOCAL_GRAY_CONTRAST_WEIGHT            = 1.89;
+static double SOBEL_SCALE_FACTOR                    = 4.8;
+static int    DEBUG_DRAW_EVERY                      = 8;
+static std::string OUTPUT_PREFIX                    = "fracture_";
+
+// ── NEW: parametri Stage 2A – Morphological Gradient ─────────────────────────
+// Mod.6 sl.15: g = (f+b) - (f-b), SE ellittico raggio 2
+static int    MORPH_GRAD_RADIUS         = 2;
+
+// ── NEW: parametri Stage 2B – Top-hat multi-orientazione ─────────────────────
+// Mod.6 sl.17: SE lineare a 6 orientazioni, lunghezza 15px
+static int    TOPHAT_LINE_LENGTH        = 15;
+static int    TOPHAT_NUM_ORIENTATIONS   = 6;
+
+// ── NEW: parametri Stage 2C – Gabor Filter Bank ───────────────────────────────
+// Mod.8 sl.124-130: bank a 6 orientazioni x 3 scale
+static double GABOR_SIGMA               = 4.0;
+static double GABOR_GAMMA               = 0.5;
+static int    GABOR_KERNEL_SIZE         = 21;
+static int    GABOR_NUM_ORIENTATIONS    = 6;
+static int    GABOR_LAMBDA_VALUES[]     = {6, 10, 16};
+
+// ── NEW: parametri Stage 2D – GLCM contrast locale ───────────────────────────
+// Mod.8 sl.55-61: patch locali
+static int    GLCM_PATCH_SIZE           = 32;
+static int    GLCM_STRIDE               = 8;
+static int    GLCM_LEVELS               = 32;
+
+// ── NEW: parametri Stage 3 – Weighted Fusion ─────────────────────────────────
+static double FUSION_WEIGHT_TOPHAT      = 0.35;
+static double FUSION_WEIGHT_MORPH_GRAD  = 0.30;
+static double FUSION_WEIGHT_GABOR       = 0.25;
+static double FUSION_WEIGHT_GLCM        = 0.10;
+static double ADAPTIVE_FUSED_PERCENTILE = 0.80;
+
+// ── NEW: parametri Stage 4 – Watershed ───────────────────────────────────────
+// Mod.7 sl.40-45
+static int    WATERSHED_DILATE_ITER     = 3;
+static int    WATERSHED_ERODE_ITER      = 2;
+
+// ── NEW: parametri Post – ASF ────────────────────────────────────────────────
+// Mod.6 sl.13-14
+static int    ASF_MAX_RADIUS            = 3;
+
+// ============================================================================
+// UTILITY
+// ============================================================================
+
+int makeOdd(int v)
+{
+    return (v < 1) ? 1 : (v % 2 == 0) ? v + 1 : v;
+}
+
+cv::Mat kernelE(int size)
+{
+    return cv::getStructuringElement(cv::MORPH_ELLIPSE,
+        cv::Size(makeOdd(size), makeOdd(size)));
+}
+
+double clampDouble(double v, double lo, double hi)
+{
+    return std::max(lo, std::min(hi, v));
+}
+
+int clampInt(int v, int lo, int hi)
+{
+    return std::max(lo, std::min(hi, v));
+}
+
+double percentile(std::vector<double> values, double q)
+{
+    if (values.empty()) return 0.0;
+    q = clampDouble(q, 0.0, 1.0);
+    std::sort(values.begin(), values.end());
+    double index = q * static_cast<double>(values.size() - 1);
+    int i0 = static_cast<int>(std::floor(index));
+    int i1 = static_cast<int>(std::ceil(index));
+    if (i0 == i1) return values[i0];
+    double t = index - static_cast<double>(i0);
+    return values[i0] * (1.0 - t) + values[i1] * t;
+}
+
+bool insideAllowedVerticalBand(const cv::Point& p, const cv::Size& sz)
+{
+    int top = static_cast<int>(sz.height * IGNORE_TOP_RATIO);
+    int bot = static_cast<int>(sz.height * (1.0 - IGNORE_BOTTOM_RATIO));
+    return p.y >= top && p.y <= bot;
+}
+
+cv::Mat improveImage(const cv::Mat& img, int bitsUsed)
+{
+    if (img.channels() != 1)
+        UCAS_THROW("L'immagine deve essere in scala di grigi");
+    cv::Mat out = img.clone();
+    int bits = bitsUsed > 0 ? bitsUsed : ucas::imdepth_detect(out);
+    if (bits > 8) ucas::imrescale(out, bits, 8);
+    if (out.depth() != CV_8U)
+        cv::normalize(out, out, 0, 255, cv::NORM_MINMAX, CV_8U);
+    return out;
+}
+
+cv::Mat enhanceGrayForDisplay(const cv::Mat& gray, const cv::Mat& boneMask)
+{
+    cv::Mat claheImg;
+    cv::Ptr<cv::CLAHE> clahe =
+        cv::createCLAHE(DISPLAY_CLAHE_CLIP,
+                        cv::Size(DISPLAY_CLAHE_TILE, DISPLAY_CLAHE_TILE));
+    clahe->apply(gray, claheImg);
+
+    cv::Mat blurred;
+    cv::GaussianBlur(claheImg, blurred, cv::Size(0, 0), UNSHARP_BLUR_SIGMA);
+    cv::Mat sharpened;
+    cv::addWeighted(claheImg, 1.0 + UNSHARP_AMOUNT,
+                    blurred, -UNSHARP_AMOUNT, 0, sharpened);
+
+    cv::Mat enhanced = gray.clone();
+    double minVal, maxVal;
+    cv::minMaxLoc(sharpened, &minVal, &maxVal, 0, 0, boneMask);
+    if (maxVal > minVal)
+    {
+        cv::Mat normalized;
+        sharpened.convertTo(normalized, CV_8U,
+            255.0 / (maxVal - minVal),
+            -minVal * 255.0 / (maxVal - minVal));
+        normalized.copyTo(enhanced, boneMask);
+    }
+    else
+    {
+        sharpened.copyTo(enhanced, boneMask);
+    }
+    return enhanced;
+}
+
+int otsu(const cv::Mat& gray)
+{
+    return ucas::getOtsuAutoThreshold(ucas::histogram(gray, 256));
+}
+
+int otsuMasked(const cv::Mat& gray, const cv::Mat& mask)
+{
+    std::vector<uchar> pixels;
+    for (int y = 0; y < gray.rows; ++y)
+    {
+        const uchar* g = gray.ptr<uchar>(y);
+        const uchar* m = mask.ptr<uchar>(y);
+        for (int x = 0; x < gray.cols; ++x)
+            if (m[x]) pixels.push_back(g[x]);
+    }
+    if (pixels.empty()) UCAS_THROW("Maschera vuota");
+    cv::Mat data(static_cast<int>(pixels.size()), 1, CV_8U, pixels.data());
+    return otsu(data);
+}
+
+cv::Mat largestComponent(const cv::Mat& mask)
+{
+    cv::Mat labels, stats, centroids;
+    int n = cv::connectedComponentsWithStats(mask, labels, stats, centroids);
+    if (n <= 1) return cv::Mat::zeros(mask.size(), CV_8U);
+    int best = 1;
+    for (int i = 2; i < n; ++i)
+        if (stats.at<int>(i, cv::CC_STAT_AREA) >
+            stats.at<int>(best, cv::CC_STAT_AREA))
+            best = i;
+    cv::Mat out = cv::Mat::zeros(mask.size(), CV_8U);
+    out.setTo(255, labels == best);
+    return out;
+}
+
+std::vector<cv::Point> largestContour(const cv::Mat& mask)
+{
+    std::vector<std::vector<cv::Point>> contours;
+    cv::findContours(mask.clone(), contours,
+                     cv::RETR_EXTERNAL, cv::CHAIN_APPROX_NONE);
+    if (contours.empty()) return {};
+    size_t best = 0;
+    double bestArea = cv::contourArea(contours[0]);
+    for (size_t i = 1; i < contours.size(); ++i)
+    {
+        double a = cv::contourArea(contours[i]);
+        if (a > bestArea) { bestArea = a; best = i; }
+    }
+    return contours[best];
+}
+
+cv::Rect safeBox(const cv::Point& p, const cv::Size& sz, int r)
+{
+    return cv::Rect(
+        std::max(0, p.x - r),
+        std::max(0, p.y - r),
+        std::max(1, std::min(sz.width,  p.x + r) - std::max(0, p.x - r)),
+        std::max(1, std::min(sz.height, p.y + r) - std::max(0, p.y - r)));
+}
+
+cv::Rect safeRectBox(const cv::Point& p, const cv::Size& sz, int rx, int ry)
+{
+    int x1 = std::max(0, p.x - rx), y1 = std::max(0, p.y - ry);
+    int x2 = std::min(sz.width,  p.x + rx);
+    int y2 = std::min(sz.height, p.y + ry);
+    return cv::Rect(x1, y1, std::max(1, x2 - x1), std::max(1, y2 - y1));
+}
+
+cv::Rect fractureBox(const cv::Point& p, const cv::Size& sz)
+{
+    return safeRectBox(p, sz, FRACTURE_BOX_RADIUS_X, FRACTURE_BOX_RADIUS_Y);
+}
+
+void fillHoles(cv::Mat& mask)
+{
+    cv::Mat tmp;
+    cv::copyMakeBorder(mask, tmp, 1, 1, 1, 1, cv::BORDER_CONSTANT, 0);
+    cv::floodFill(tmp, cv::Point(0, 0), cv::Scalar(255));
+    tmp = tmp(cv::Rect(1, 1, mask.cols, mask.rows));
+    cv::Mat holes;
+    cv::bitwise_not(tmp, holes);
+    mask |= holes;
+}
+
+// ============================================================================
+// STAGE 0  -  PREPROCESSING
+// Mod.3 sl.37: CLAHE  |  Mod.4 sl.54: Bilateral Filter
+// ============================================================================
+
+// NEW: bilateral filter edge-preserving applicato prima dell'estrazione features
+// "non-linear, edge-preserving, noise-reducing smoothing filter"
+// sigmaColor=75: pixel con diff. intensita > 75 non vengono mescolati
+cv::Mat bilateralPreprocess(const cv::Mat& gray)
+{
+    cv::Mat bilateral;
+    cv::bilateralFilter(gray, bilateral, 9, 75.0, 75.0);
+    return bilateral;
+}
+
+// ============================================================================
+// STAGE 1  -  SEGMENTAZIONE OSSEA
+// Mod.5 sl.9: Otsu  |  Mod.5/6: Open/Close  |  Mod.5 sl.27: CCA
+// Mod.5 sl.52: border extraction (cortex = mask - erode(mask))
+// ============================================================================
+
+void computeSegmentation(const cv::Mat& gray,
+                         cv::Mat& boneMask,
+                         cv::Mat& edges)
+{
+    // segmentazione del corpo (arto)
+    cv::Mat bodyMask = gray.clone();
+    ucas::binarize(bodyMask, otsu(gray));
+    bodyMask = largestComponent(bodyMask);
+    if (cv::countNonZero(bodyMask) == 0)
+        UCAS_THROW("Nessun arto trovato");
+
+    // CLAHE locale (Mod.3 sl.37)
+    cv::Mat claheImg;
+    cv::Ptr<cv::CLAHE> clahe =
+        cv::createCLAHE(std::max(0.1, CLAHE_CLIP), cv::Size(8, 8));
+    clahe->apply(gray, claheImg);
+
+    // Otsu mascherato (Mod.5 sl.9)
+    int threshold = std::max(0, otsuMasked(claheImg, bodyMask) - BONE_OFFSET);
+    boneMask = claheImg.clone();
+    ucas::binarize(boneMask, threshold);
+    boneMask.setTo(0, ~bodyMask);
+
+    // Opening + Closing (Mod.5 sl.47 / Mod.6 sl.8)
+    cv::morphologyEx(boneMask, boneMask,
+                     cv::MORPH_OPEN,  kernelE(BONE_OPEN_SIZE));
+    cv::morphologyEx(boneMask, boneMask,
+                     cv::MORPH_CLOSE, kernelE(BONE_CLOSE_SIZE));
+
+    // CCA: componente piu grande = osso (Mod.5 sl.27)
+    boneMask = largestComponent(boneMask);
+    fillHoles(boneMask);
+    if (cv::countNonZero(boneMask) == 0)
+        UCAS_THROW("Nessun osso trovato");
+
+    // Canny edges (invariato)
+    cv::Mat cannyInput = cv::Mat::zeros(gray.size(), gray.type());
+    gray.copyTo(cannyInput, boneMask);
+    cv::GaussianBlur(cannyInput, cannyInput, cv::Size(0, 0), 1.0);
+    cv::Canny(cannyInput, edges,
+              std::max(0, std::min(255, CANNY_LOW)),
+              std::max(1, std::min(255, CANNY_HIGH)));
+    edges.setTo(0, ~boneMask);
+}
+
+// Estrazione corteccia ossea (Mod.5 sl.52)
+// cortex = boneMask - erode(boneMask)
+cv::Mat extractCortex(const cv::Mat& boneMask)
+{
+    cv::Mat eroded;
+    cv::erode(boneMask, eroded, kernelE(3), cv::Point(-1, -1), 3);
+    cv::Mat cortex;
+    cv::subtract(boneMask, eroded, cortex);
+    return cortex;
+}
+
+cv::Mat createInnerBoneMask(const cv::Mat& boneMask, int margin)
+{
+    cv::Mat inner;
+    cv::erode(boneMask, inner, kernelE(margin));
+    return inner;
+}
+
+// ============================================================================
+// STAGE 2A  -  MORPHOLOGICAL GRADIENT  (Mod.6 sl.15)
+// g = (f dilatato b) - (f eroso b)
+// "depends less on edge directionality" rispetto a Sobel
+// ============================================================================
+
+cv::Mat computeMorphologicalGradient(const cv::Mat& gray,
+                                     const cv::Mat& boneMask)
+{
+    cv::Mat kern = kernelE(MORPH_GRAD_RADIUS);
+    cv::Mat dil, ero;
+    cv::dilate(gray, dil, kern);
+    cv::erode(gray,  ero, kern);
+    cv::Mat morphGrad;
+    cv::subtract(dil, ero, morphGrad);
+    morphGrad.setTo(0, ~boneMask);
+    return morphGrad;
+}
+
+// ============================================================================
+// STAGE 2B  -  TOP-HAT MULTI-ORIENTAZIONE  (Mod.6 sl.17-18)
+// Somma di top-hat + bottom-hat con SE lineari a 6 orientazioni.
+// Come nell'esempio delle slide (microaneurismi -> fratture lineari).
+// ============================================================================
+
+cv::Mat buildLinearKernel(int length, double angleDeg)
+{
+    cv::Mat kern = cv::Mat::zeros(length, length, CV_8U);
+    double rad = angleDeg * CV_PI / 180.0;
+    int half = length / 2;
+    int dx = static_cast<int>(std::round(std::cos(rad) * half));
+    int dy = static_cast<int>(std::round(std::sin(rad) * half));
+    cv::line(kern,
+             cv::Point(half - dx, half - dy),
+             cv::Point(half + dx, half + dy),
+             cv::Scalar(1), 1);
+    return kern;
+}
+
+cv::Mat computeTopHatMultiOrientation(const cv::Mat& gray,
+                                      const cv::Mat& boneMask)
+{
+    cv::Mat topHatSum = cv::Mat::zeros(gray.size(), CV_32F);
+    cv::Mat botHatSum = cv::Mat::zeros(gray.size(), CV_32F);
+
+    for (int k = 0; k < TOPHAT_NUM_ORIENTATIONS; ++k)
+    {
+        // 0, 30, 60, 90, 120, 150 gradi
+        double angle = 180.0 * k / TOPHAT_NUM_ORIENTATIONS;
+        cv::Mat lineKern = buildLinearKernel(TOPHAT_LINE_LENGTH, angle);
+
+        // Top-hat: f - (f o b)  ->  strutture CHIARE piu piccole di SE
+        cv::Mat opened;
+        cv::morphologyEx(gray, opened, cv::MORPH_OPEN, lineKern);
+        cv::Mat topHat;
+        cv::subtract(gray, opened, topHat);
+        topHatSum += cv::Mat(topHat) * (1.0f / TOPHAT_NUM_ORIENTATIONS);
+
+        // Bottom-hat: (f . b) - f  ->  strutture SCURE (linee frattura)
+        cv::Mat closed;
+        cv::morphologyEx(gray, closed, cv::MORPH_CLOSE, lineKern);
+        cv::Mat botHat;
+        cv::subtract(closed, gray, botHat);
+        botHatSum += cv::Mat(botHat) * (1.0f / TOPHAT_NUM_ORIENTATIONS);
+    }
+
+    cv::Mat combined = topHatSum + botHatSum;
+    combined.setTo(0, ~boneMask);
+    return combined;  // CV_32F
+}
+
+// ============================================================================
+// STAGE 2C  -  GABOR FILTER BANK  (Mod.8 sl.124-130)
+// Bank a GABOR_NUM_ORIENTATIONS orientazioni x 3 scale (lambda).
+// "analyze specific frequency content in specific directions"
+// ============================================================================
+
+cv::Mat computeGaborBank(const cv::Mat& gray, const cv::Mat& boneMask)
+{
+    cv::Mat gaborMax = cv::Mat::zeros(gray.size(), CV_32F);
+    cv::Mat grayF;
+    gray.convertTo(grayF, CV_32F);
+
+    for (int k = 0; k < GABOR_NUM_ORIENTATIONS; ++k)
+    {
+        double theta = CV_PI * k / GABOR_NUM_ORIENTATIONS;
+
+        for (int li = 0; li < 3; ++li)
+        {
+            double lambda = static_cast<double>(GABOR_LAMBDA_VALUES[li]);
+            cv::Mat kern = cv::getGaborKernel(
+                cv::Size(GABOR_KERNEL_SIZE, GABOR_KERNEL_SIZE),
+                GABOR_SIGMA, theta, lambda, GABOR_GAMMA, 0.0, CV_32F);
+
+            double ksum = cv::sum(kern)[0];
+            if (std::abs(ksum) > 1e-9) kern /= ksum;
+
+            cv::Mat resp;
+            cv::filter2D(grayF, resp, CV_32F, kern);
+            cv::abs(resp);
+            cv::max(gaborMax, resp, gaborMax);
+        }
+    }
+    gaborMax.setTo(0, ~boneMask);
+    return gaborMax;  // CV_32F
+}
+
+// ============================================================================
+// STAGE 2D  -  GLCM CONTRAST LOCALE  (Mod.8 sl.55-61)
+// "Contrast = sum (i-j)^2 * p_ij -> 0 per immagini omogenee"
+// Alta contrast in zona ossea = anomalia di texture = possibile frattura.
+// ============================================================================
+
+double glcmContrast1D(const cv::Mat& patch8, int levels)
+{
+    std::vector<std::vector<double>> glcm(
+        levels, std::vector<double>(levels, 0.0));
+    int count = 0;
+
+    for (int y = 0; y < patch8.rows; ++y)
+    {
+        const uchar* row = patch8.ptr<uchar>(y);
+        for (int x = 0; x < patch8.cols - 1; ++x)
+        {
+            int i = row[x], j = row[x + 1];
+            if (i < levels && j < levels) { glcm[i][j]++; count++; }
+            if (j < levels && i < levels) { glcm[j][i]++; count++; }
+        }
+    }
+    if (count == 0) return 0.0;
+
+    double contrast = 0.0;
+    for (int i = 0; i < levels; ++i)
+        for (int j = 0; j < levels; ++j)
+            contrast += (i - j) * (i - j) * glcm[i][j] / count;
+    return contrast;
+}
+
+cv::Mat computeLocalGLCMContrast(const cv::Mat& gray,
+                                  const cv::Mat& boneMask)
+{
+    cv::Mat contrastMap = cv::Mat::zeros(gray.size(), CV_32F);
+    cv::Mat countMap    = cv::Mat::zeros(gray.size(), CV_32F);
+
+    for (int y = 0; y <= gray.rows - GLCM_PATCH_SIZE; y += GLCM_STRIDE)
+    {
+        for (int x = 0; x <= gray.cols - GLCM_PATCH_SIZE; x += GLCM_STRIDE)
+        {
+            cv::Rect roi(x, y, GLCM_PATCH_SIZE, GLCM_PATCH_SIZE);
+            cv::Mat roiMask = boneMask(roi);
+            if (cv::mean(roiMask)[0] < 128.0) continue;
+
+            cv::Mat patch = gray(roi);
+            cv::Mat patchQ;
+            patch.convertTo(patchQ, CV_8U, GLCM_LEVELS / 256.0);
+            patchQ.setTo(GLCM_LEVELS - 1,
+                patchQ >= static_cast<uchar>(GLCM_LEVELS));
+
+            double contrast = glcmContrast1D(patchQ, GLCM_LEVELS);
+
+            cv::Mat roiContrast = contrastMap(roi);
+            cv::Mat roiCount    = countMap(roi);
+            roiContrast += static_cast<float>(contrast);
+            roiCount    += 1.0f;
+        }
+    }
+
+    cv::Mat result = cv::Mat::zeros(gray.size(), CV_32F);
+    cv::divide(contrastMap, countMap + 1e-9f, result);
+    result.setTo(0, ~boneMask);
+    return result;  // CV_32F
+}
+
+// ============================================================================
+// STAGE 3  -  WEIGHTED FUSION delle 4 mappe
+// Pesi: Top-hat 35%, Morph.Gradient 30%, Gabor 25%, GLCM 10%
+// ============================================================================
+
+cv::Mat normalizeMapOnMask(const cv::Mat& src, const cv::Mat& mask)
+{
+    double minVal, maxVal;
+    cv::minMaxLoc(src, &minVal, &maxVal, nullptr, nullptr, mask);
+    if (maxVal - minVal < 1e-9)
+        return cv::Mat::zeros(src.size(), CV_32F);
+    cv::Mat out;
+    src.convertTo(out, CV_32F,
+                  1.0 / (maxVal - minVal),
+                  -minVal / (maxVal - minVal));
+    out.setTo(0, ~mask);
+    return out;
+}
+
+cv::Mat computeFusedMap(const cv::Mat& morphGrad,   // CV_8U  (Stage 2A)
+                         const cv::Mat& topHat,      // CV_32F (Stage 2B)
+                         const cv::Mat& gabor,       // CV_32F (Stage 2C)
+                         const cv::Mat& glcmMap,     // CV_32F (Stage 2D)
+                         const cv::Mat& boneMask)
+{
+    cv::Mat morphGradF;
+    morphGrad.convertTo(morphGradF, CV_32F);
+
+    cv::Mat mg = normalizeMapOnMask(morphGradF, boneMask);
+    cv::Mat th = normalizeMapOnMask(topHat,     boneMask);
+    cv::Mat gb = normalizeMapOnMask(gabor,       boneMask);
+    cv::Mat gl = normalizeMapOnMask(glcmMap,     boneMask);
+
+    cv::Mat fused = FUSION_WEIGHT_TOPHAT     * th
+                  + FUSION_WEIGHT_MORPH_GRAD * mg
+                  + FUSION_WEIGHT_GABOR      * gb
+                  + FUSION_WEIGHT_GLCM       * gl;
+
+    fused.setTo(0, ~boneMask);
+    return fused;  // CV_32F in [0,1]
+}
+
+// ============================================================================
+// STAGE 4  -  MARKER-CONTROLLED WATERSHED  (Mod.7 sl.40-45)
+// Internal markers = zone ad alta fused_map (fratture candidate)
+// External markers = bordo della maschera ossea (osso sano)
+// ============================================================================
+
+cv::Mat computeWatershedMask(const cv::Mat& gray,
+                              const cv::Mat& fusedMap,
+                              const cv::Mat& boneMask)
+{
+    // normalizza fused map in [0, 255]
+    cv::Mat fused8;
+    cv::normalize(fusedMap, fused8, 0, 255, cv::NORM_MINMAX, CV_8U);
+
+    // marker interni: Otsu sulla fused map (Mod.7 sl.44)
+    cv::Mat markersFG;
+    cv::threshold(fused8, markersFG, 0, 255,
+                  cv::THRESH_BINARY | cv::THRESH_OTSU);
+    cv::erode(markersFG, markersFG, kernelE(3),
+              cv::Point(-1, -1), WATERSHED_ERODE_ITER);
+
+    // marker esterni: bordo dilatato della bone mask
+    cv::Mat dilatedMask;
+    cv::dilate(boneMask, dilatedMask, kernelE(3),
+               cv::Point(-1, -1), WATERSHED_DILATE_ITER);
+    cv::Mat markersBG;
+    cv::subtract(dilatedMask, boneMask, markersBG);
+
+    // costruisci immagine markers (Mod.7 sl.43)
+    cv::Mat markers = cv::Mat::zeros(gray.size(), CV_32S);
+    markers.setTo(1, markersBG);   // background = osso sano
+    markers.setTo(2, markersFG);   // foreground = frattura candidata
+
+    // watershed richiede immagine BGR
+    cv::Mat grayBGR;
+    cv::cvtColor(gray, grayBGR, cv::COLOR_GRAY2BGR);
+    cv::watershed(grayBGR, markers);
+
+    cv::Mat fractureMask = cv::Mat::zeros(gray.size(), CV_8U);
+    fractureMask.setTo(255, markers == 2);
+    fractureMask &= boneMask;
+    return fractureMask;
+}
+
+// ============================================================================
+// POST-PROCESSING  -  ALTERNATING SEQUENTIAL FILTERING  (Mod.6 sl.13-14)
+// "opening + closing ripetuti con SE di raggio crescente"
+// Rimuove falsi positivi puntiformi, preserva strutture lineari (fratture).
+// ============================================================================
+
+cv::Mat alternatingSequentialFilter(const cv::Mat& mask)
+{
+    cv::Mat result = mask.clone();
+    for (int r = 1; r <= ASF_MAX_RADIUS; ++r)
+    {
+        cv::Mat k = kernelE(2 * r + 1);
+        cv::morphologyEx(result, result, cv::MORPH_OPEN,  k);
+        cv::morphologyEx(result, result, cv::MORPH_CLOSE, k);
+    }
+    return result;
+}
+
+// ============================================================================
+// GRADIENTE SOBEL INTERNO ORIGINALE (invariato)
+// ============================================================================
+
+cv::Mat computeInternalGradientMagnitude(const cv::Mat& grayEnhanced,
+                                         const cv::Mat& innerBoneMask)
+{
+    cv::Mat blurred;
+    cv::GaussianBlur(grayEnhanced, blurred,
+                     cv::Size(0, 0), INTERNAL_GRADIENT_BLUR_SIGMA);
+
+    cv::Mat gradX, gradY, gradMag;
+    cv::Sobel(blurred, gradX, CV_32F, 1, 0, 3);
+    cv::Sobel(blurred, gradY, CV_32F, 0, 1, 3);
+    cv::magnitude(gradX, gradY, gradMag);
+    gradMag *= SOBEL_SCALE_FACTOR;
+
+    // local contrast amplification
+    cv::Mat localMean;
+    cv::GaussianBlur(grayEnhanced, localMean, cv::Size(0, 0), 3.0);
+    cv::Mat grayF, localMeanF;
+    grayEnhanced.convertTo(grayF, CV_32F);
+    localMean.convertTo(localMeanF, CV_32F);
+    cv::Mat localContrast;
+    cv::absdiff(grayF, localMeanF, localContrast);
+
+    std::vector<double> contrastValues;
+    for (int y = 0; y < localContrast.rows; ++y)
+    {
+        const float* c = localContrast.ptr<float>(y);
+        const uchar* m = innerBoneMask.ptr<uchar>(y);
+        for (int x = 0; x < localContrast.cols; ++x)
+            if (m[x]) contrastValues.push_back(c[x]);
+    }
+    double p90 = percentile(contrastValues, 0.90);
+    cv::Mat localContrastNorm = cv::Mat::zeros(localContrast.size(), CV_32F);
+    if (p90 > 1e-6)
+    {
+        localContrast.convertTo(localContrastNorm, CV_32F, 1.0 / p90);
+        cv::min(localContrastNorm, 1.0, localContrastNorm);
+    }
+    cv::Mat amplification = 1.0 + LOCAL_GRAY_CONTRAST_WEIGHT * localContrastNorm;
+    cv::Mat sensitiveGradient;
+    cv::multiply(gradMag, amplification, sensitiveGradient);
+    sensitiveGradient.setTo(0, ~innerBoneMask);
+    return sensitiveGradient;
+}
+
+cv::Mat normalizeFloatForDisplay(const cv::Mat& src)
+{
+    cv::Mat out;
+    cv::normalize(src, out, 0, 255, cv::NORM_MINMAX, CV_8U);
+    return out;
+}
+
+// ============================================================================
+// ADAPTIVE THRESHOLDS + DECISION (ora include fusedScore)
+// ============================================================================
+
+InternalAdaptiveThresholds computeAdaptiveThresholdsFromDebug(
+    const std::vector<InternalGradientDebug>& infos)
+{
+    std::vector<double> meanGradV, stdGradV, maxGradV,
+                        stdGrayV, darkDiffV, fusedV;
+
+    for (const auto& inf : infos)
+    {
+        meanGradV.push_back(inf.meanGradient);
+        stdGradV.push_back(inf.stdGradient);
+        maxGradV.push_back(inf.maxGradient);
+        stdGrayV.push_back(inf.stdGray);
+        darkDiffV.push_back(inf.darkDifference);
+        fusedV.push_back(inf.fusedScore);  // NEW
+    }
+
+    InternalAdaptiveThresholds t;
+    t.meanGray       = INTERNAL_MEAN_GRAY_MIN_THRESHOLD;
+    t.meanGradient   = clampDouble(
+        percentile(meanGradV, ADAPTIVE_MEAN_GRADIENT_PERCENTILE),
+        INTERNAL_GRADIENT_MEAN_MIN_THRESHOLD,
+        INTERNAL_GRADIENT_MEAN_MAX_THRESHOLD);
+    t.stdGradient    = clampDouble(
+        percentile(stdGradV, ADAPTIVE_STD_GRADIENT_PERCENTILE),
+        INTERNAL_GRADIENT_STD_MIN_THRESHOLD,
+        INTERNAL_GRADIENT_STD_MAX_THRESHOLD);
+    t.maxGradient    = clampDouble(
+        percentile(maxGradV, ADAPTIVE_MAX_GRADIENT_PERCENTILE),
+        INTERNAL_GRADIENT_PEAK_MIN_THRESHOLD,
+        INTERNAL_GRADIENT_PEAK_MAX_THRESHOLD);
+    t.stdGray        = clampDouble(
+        percentile(stdGrayV, ADAPTIVE_GRAY_STD_PERCENTILE),
+        INTERNAL_GRAY_STD_MIN_THRESHOLD,
+        INTERNAL_GRAY_STD_MAX_THRESHOLD);
+    t.darkDifference = clampDouble(
+        percentile(darkDiffV, ADAPTIVE_DARK_DIFF_PERCENTILE),
+        INTERNAL_DARK_LINE_MIN_THRESHOLD,
+        INTERNAL_DARK_LINE_MAX_THRESHOLD);
+
+    // NEW: soglia adattiva sulla fused map
+    t.fusedScoreThreshold = percentile(fusedV, ADAPTIVE_FUSED_PERCENTILE);
+    return t;
+}
+
+InternalDecisionDebug evaluateInternalFractureDecision(
+    const InternalGradientDebug&     info,
+    const InternalAdaptiveThresholds& t)
+{
+    InternalDecisionDebug d;
+    d.passMeanGray      = info.meanGray      >= t.meanGray;
+    d.passMeanGradient  = info.meanGradient  >= t.meanGradient;
+    d.passStdGradient   = info.stdGradient   >= t.stdGradient;
+    d.passMaxGradient   = info.maxGradient   >= t.maxGradient;
+    d.passStdGray       = info.stdGray       >= t.stdGray;
+    d.passDarkDifference= info.darkDifference>= t.darkDifference;
+    d.passFusedScore    = info.fusedScore    >= t.fusedScoreThreshold;  // NEW
+
+    d.strongTests = 0;
+    if (d.passMeanGradient)    d.strongTests++;
+    if (d.passStdGradient)     d.strongTests++;
+    if (d.passMaxGradient)     d.strongTests++;
+    if (d.passStdGray)         d.strongTests++;
+    if (d.passDarkDifference)  d.strongTests++;
+    if (d.passFusedScore)      d.strongTests++;  // NEW: contribuisce ai test forti
+
+    d.veryStrongGradient =
+        d.passMeanGradient && d.passStdGradient && d.passMaxGradient &&
+        (d.passStdGray || d.passDarkDifference);
+
+    d.balancedStrong = d.strongTests >= INTERNAL_MIN_STRONG_TESTS;
+
+    // NEW: se la fused map e sopra soglia abbassa il requisito
+    // (cattura fratture deboli che il solo Sobel perde)
+    d.possibleFracture =
+        d.passMeanGray &&
+        (d.veryStrongGradient || d.balancedStrong || d.passFusedScore);
+
+    return d;
+}
+
+bool isPossibleInternalFracture(const InternalGradientDebug&      info,
+                                const InternalAdaptiveThresholds& t)
+{
+    return evaluateInternalFractureDecision(info, t).possibleFracture;
+}
+
+// ============================================================================
+// CLUSTER + MERGE (invariati)
+// ============================================================================
+
+cv::Point2d weightedClusterCenter(const std::vector<Fracture>& items)
+{
+    double wsX = 0, wsY = 0, ws = 0;
+    for (const auto& it : items)
+    {
+        double w = std::max(0.0001, it.score);
+        wsX += it.location.x * w;
+        wsY += it.location.y * w;
+        ws  += w;
+    }
+    return ws > 0 ? cv::Point2d(wsX / ws, wsY / ws) : cv::Point2d(0, 0);
+}
+
+double localSupportScore(const Fracture& c,
+                         const std::vector<Fracture>& items)
+{
+    double support = 0;
+    for (const auto& it : items)
+    {
+        double d = cv::norm(c.location - it.location);
+        if (d > CLUSTER_RADIUS) continue;
+        double sw  = 1.0 - d / std::max(1.0, (double)CLUSTER_RADIUS);
+        double scw = std::sqrt(std::max(0.0001, it.score));
+        support += sw * scw;
+    }
+    return support;
+}
+
+Fracture chooseBestClusterRepresentative(
+    const std::vector<Fracture>& items, const cv::Size& sz)
+{
+    if (items.size() == 1) return items[0];
+    cv::Point2d center = weightedClusterCenter(items);
+    double maxScore = 0, maxDist = 1, maxSup = 0;
+    std::vector<double> supports(items.size(), 0);
+    for (size_t i = 0; i < items.size(); ++i)
+    {
+        maxScore = std::max(maxScore, items[i].score);
+        double d = cv::norm(cv::Point2d(items[i].location) - center);
+        maxDist  = std::max(maxDist, d);
+        supports[i] = localSupportScore(items[i], items);
+        maxSup   = std::max(maxSup, supports[i]);
+    }
+    double  bestRank = -DBL_MAX;
+    Fracture best    = items[0];
+    for (size_t i = 0; i < items.size(); ++i)
+    {
+        double ns  = items[i].score / std::max(0.0001, maxScore);
+        double d   = cv::norm(cv::Point2d(items[i].location) - center);
+        double nc  = clampDouble(1.0 - d / std::max(1.0, maxDist), 0.0, 1.0);
+        double nsp = supports[i] / std::max(0.0001, maxSup);
+        double rank = CLUSTER_SCORE_WEIGHT       * ns
+                    + CLUSTER_CENTRALITY_WEIGHT  * nc
+                    + CLUSTER_LOCAL_SUPPORT_WEIGHT * nsp;
+        if (rank > bestRank) { bestRank = rank; best = items[i]; }
+    }
+    best.box = fractureBox(best.location, sz);
+    return best;
+}
+
+std::vector<Fracture> mergeCloseFracturesByClusterRepresentative(
+    const std::vector<Fracture>& candidates, const cv::Size& sz)
+{
+    if (candidates.empty()) return {};
+
+    auto sorted = candidates;
+    std::sort(sorted.begin(), sorted.end(),
+        [](const Fracture& a, const Fracture& b)
+        { return a.score > b.score; });
+
+    std::vector<FractureCluster> clusters;
+    for (const auto& cand : sorted)
+    {
+        int bestIdx = -1; double bestDist = DBL_MAX;
+        for (size_t j = 0; j < clusters.size(); ++j)
+        {
+            cv::Point2d c = weightedClusterCenter(clusters[j].items);
+            double d = cv::norm(cv::Point2d(cand.location) - c);
+            if (d < CLUSTER_RADIUS && d < bestDist)
+                { bestDist = d; bestIdx = (int)j; }
+        }
+        if (bestIdx >= 0)
+            clusters[bestIdx].items.push_back(cand);
+        else
+        {
+            FractureCluster cl;
+            cl.items.push_back(cand);
+            clusters.push_back(cl);
+        }
+    }
+
+    std::vector<ClusterRepresentative> reps;
+    for (auto& cl : clusters)
+    {
+        if (cl.items.empty()) continue;
+        Fracture rep = chooseBestClusterRepresentative(cl.items, sz);
+        double cs = 0, ms = 0;
+        for (const auto& it : cl.items)
+        {
+            cs += std::sqrt(std::max(0.0001, it.score));
+            ms  = std::max(ms, it.score);
+        }
+        rep.score = ms + cs * 0.15;
+        rep.box   = fractureBox(rep.location, sz);
+        ClusterRepresentative cr;
+        cr.fracture    = rep;
+        cr.clusterScore = rep.score;
+        cr.clusterSize  = (int)cl.items.size();
+        reps.push_back(cr);
+    }
+    std::sort(reps.begin(), reps.end(),
+        [](const ClusterRepresentative& a, const ClusterRepresentative& b)
+        {
+            return std::abs(a.clusterScore - b.clusterScore) > 1e-6
+                ? a.clusterScore > b.clusterScore
+                : a.clusterSize  > b.clusterSize;
+        });
+
+    std::vector<Fracture> result;
+    for (const auto& r : reps)
+    {
+        bool tooClose = false;
+        for (const auto& f : result)
+            if (cv::norm(r.fracture.location - f.location) <
+                INTERNAL_MIN_DISTANCE_BETWEEN_FRACTURES)
+                { tooClose = true; break; }
+        if (!tooClose) result.push_back(r.fracture);
+        if ((int)result.size() >= MAX_FRACTURES_TO_SHOW) break;
+    }
+    return result;
+}
+
+// ============================================================================
+// DETECT INTERNAL FRACTURES  -  pipeline arricchita
+// ============================================================================
+
+std::vector<Fracture> detectInternalFracturesByGradientAndGray(
+    const cv::Mat&                     grayEnhanced,
+    const cv::Mat&                     boneMask,
+    cv::Mat&                           innerBoneMask,
+    cv::Mat&                           internalGradient,
+    std::vector<InternalGradientDebug>& debugInfos,
+    InternalAdaptiveThresholds&        adaptiveThresholds)
+{
+    debugInfos.clear();
+    innerBoneMask = createInnerBoneMask(boneMask, INTERNAL_MARGIN_FROM_CONTOUR);
+    if (cv::countNonZero(innerBoneMask) == 0) return {};
+
+    // ── Stage 0: Bilateral preprocessing (Mod.4 sl.54) ───────────────────────
+    cv::Mat grayBilateral = bilateralPreprocess(grayEnhanced);  // NEW
+
+    // ── Stage 2A: Morphological Gradient (Mod.6 sl.15) ───────────────────────
+    cv::Mat morphGrad =                                          // NEW
+        computeMorphologicalGradient(grayBilateral, innerBoneMask);
+
+    // ── Stage 2B: Top-hat multi-orientazione (Mod.6 sl.17) ───────────────────
+    cv::Mat topHat =                                             // NEW
+        computeTopHatMultiOrientation(grayBilateral, innerBoneMask);
+
+    // ── Stage 2C: Gabor Filter Bank (Mod.8 sl.124) ───────────────────────────
+    cv::Mat gabor =                                              // NEW
+        computeGaborBank(grayBilateral, innerBoneMask);
+
+    // ── Stage 2D: GLCM Contrast locale (Mod.8 sl.55) ─────────────────────────
+    cv::Mat glcmMap =                                            // NEW
+        computeLocalGLCMContrast(grayBilateral, innerBoneMask);
+
+    // ── Stage 3: Weighted Fusion ──────────────────────────────────────────────
+    cv::Mat fusedMap =                                           // NEW
+        computeFusedMap(morphGrad, topHat, gabor, glcmMap, innerBoneMask);
+
+    // ── Stage 4: Watershed (Mod.7 sl.40) ─────────────────────────────────────
+    cv::Mat watershedMask =                                      // NEW
+        computeWatershedMask(grayBilateral, fusedMap, innerBoneMask);
+
+    // ── Post: ASF (Mod.6 sl.13) ──────────────────────────────────────────────
+    watershedMask = alternatingSequentialFilter(watershedMask); // NEW
+
+    // ── Gradiente Sobel originale (invariato) ─────────────────────────────────
+    internalGradient =
+        computeInternalGradientMagnitude(grayEnhanced, innerBoneMask);
+
+    // ── Scan delle ROI ────────────────────────────────────────────────────────
+    std::vector<Fracture> candidates;
+    cv::Rect innerBox = cv::boundingRect(innerBoneMask);
+    int regionCounter = 1;
+
+    for (int y = innerBox.y;
+         y < innerBox.y + innerBox.height;
+         y += INTERNAL_SCAN_STEP)
+    {
+        for (int x = innerBox.x;
+             x < innerBox.x + innerBox.width;
+             x += INTERNAL_SCAN_STEP)
+        {
+            cv::Point p(x, y);
+            if (innerBoneMask.at<uchar>(p) == 0) continue;
+            if (!insideAllowedVerticalBand(p, grayEnhanced.size())) continue;
+
+            cv::Rect roi = safeBox(p, grayEnhanced.size(), INTERNAL_ROI_RADIUS);
+            cv::Mat roiGray     = grayEnhanced(roi);
+            cv::Mat roiMask     = innerBoneMask(roi);
+            cv::Mat roiGradient = internalGradient(roi);
+
+            int maskPixels = cv::countNonZero(roiMask);
+            if (maskPixels < INTERNAL_MIN_MASK_PIXELS) continue;
+
+            // features originali
+            cv::Scalar meanGray, stdGray;
+            cv::meanStdDev(roiGray, meanGray, stdGray, roiMask);
+            double minGray, maxGray;
+            cv::minMaxLoc(roiGray, &minGray, &maxGray, 0, 0, roiMask);
+            cv::Scalar meanGrad, stdGrad;
+            cv::meanStdDev(roiGradient, meanGrad, stdGrad, roiMask);
+            double minGrad, maxGrad;
+            cv::minMaxLoc(roiGradient, &minGrad, &maxGrad, 0, 0, roiMask);
+
+            // NEW: features dalle mappe aggiuntive
+            cv::Mat roiMorphGradF;
+            cv::Mat(morphGrad(roi)).convertTo(roiMorphGradF, CV_32F);
+            cv::Scalar meanMG = cv::mean(roiMorphGradF, roiMask);
+
+            cv::Scalar meanTH  = cv::mean(topHat(roi),   roiMask);
+            cv::Scalar meanGB  = cv::mean(gabor(roi),    roiMask);
+            cv::Scalar meanGL  = cv::mean(glcmMap(roi),  roiMask);
+            cv::Scalar meanFu  = cv::mean(fusedMap(roi), roiMask);
+
+            // NEW: bonus se la ROI interseca la watershed mask
+            bool inWatershed =
+                cv::countNonZero(watershedMask(roi)) > 0;
+
+            InternalGradientDebug info;
+            info.id              = regionCounter++;
+            info.roi             = roi;
+            info.center          = p;
+            info.meanGray        = meanGray[0];
+            info.stdGray         = stdGray[0];
+            info.minGray         = minGray;
+            info.maxGray         = maxGray;
+            info.meanGradient    = meanGrad[0];
+            info.stdGradient     = stdGrad[0];
+            info.maxGradient     = maxGrad;
+            info.darkDifference  = meanGray[0] - minGray;
+            info.morphGradMean   = meanMG[0];  // NEW
+            info.topHatMean      = meanTH[0];  // NEW
+            info.gaborMean       = meanGB[0];  // NEW
+            info.glcmContrast    = meanGL[0];  // NEW
+            info.fusedScore      = meanFu[0]   // NEW
+                                 + (inWatershed ? 0.15 : 0.0);
+            info.possibleFracture = false;
+            debugInfos.push_back(info);
+        }
+    }
+
+    if (debugInfos.empty()) return {};
+
+    // soglie adattive (ora include fusedScoreThreshold)
+    adaptiveThresholds = computeAdaptiveThresholdsFromDebug(debugInfos);
+
+    // decisione e costruzione candidati
+    for (auto& info : debugInfos)
+    {
+        info.possibleFracture =
+            isPossibleInternalFracture(info, adaptiveThresholds);
+        if (!info.possibleFracture) continue;
+
+        Fracture f;
+        f.regionId = info.id;
+        f.method   = "INTERNAL";
+        f.location = info.center;
+
+        // NEW: score arricchito con contributi delle nuove mappe
+        f.score = info.meanGradient
+                + info.stdGradient    * 1.3
+                + info.maxGradient
+                + info.stdGray        * 2.0
+                + std::max(0.0, info.darkDifference) * 2.0
+                + info.topHatMean     * 0.8   // NEW
+                + info.morphGradMean  * 0.6   // NEW
+                + info.gaborMean      * 0.5   // NEW
+                + info.glcmContrast   * 0.3   // NEW
+                + info.fusedScore     * 50.0; // NEW (normalizzato [0,1])
+
+        f.directionChange = 0.0;
+        f.box = fractureBox(info.center, grayEnhanced.size());
+        candidates.push_back(f);
+    }
+
+    return mergeCloseFracturesByClusterRepresentative(
+        candidates, grayEnhanced.size());
+}
+
+// ============================================================================
+// DETECT EXTERNAL FRACTURES (invariato)
+// ============================================================================
+
+double normalizeAngleDiff(double diff)
+{
+    while (diff >  180.0) diff -= 360.0;
+    while (diff < -180.0) diff += 360.0;
+    return std::abs(diff);
+}
+
+double directionChangeDeg(const cv::Point& a,
+                          const cv::Point& b,
+                          const cv::Point& c)
+{
+    cv::Point2d v1 = b - a, v2 = c - b;
+    if (cv::norm(v1) < 1e-6 || cv::norm(v2) < 1e-6) return 0.0;
+    double a1 = std::atan2(v1.y, v1.x) * 180.0 / CV_PI;
+    double a2 = std::atan2(v2.y, v2.x) * 180.0 / CV_PI;
+    return normalizeAngleDiff(a2 - a1);
+}
+
+bool nearBorder(const cv::Point& p, const cv::Rect& box)
+{
+    return std::abs(p.x - box.x)                    < BORDER_MARGIN ||
+           std::abs(p.x - box.x - box.width)         < BORDER_MARGIN ||
+           std::abs(p.y - box.y)                    < BORDER_MARGIN ||
+           std::abs(p.y - box.y - box.height)        < BORDER_MARGIN;
+}
+
+bool validExternalFracture(double dc, int ec, double ed)
+{
+    return dc >= DIRECTION_CHANGE_THRESHOLD &&
+           ec >= EDGE_COUNT_THRESHOLD       &&
+           ed >= EDGE_DENSITY_THRESHOLD;
+}
+
+std::vector<Fracture> detectExternalFractures(const cv::Mat& boneMask,
+                                              const cv::Mat& edges)
+{
+    std::vector<Fracture> candidates;
+    std::vector<cv::Point> contour = largestContour(boneMask);
+    if (contour.size() < (size_t)MIN_CONTOUR_SIZE) return {};
+    cv::Rect boneBox = cv::boundingRect(contour);
+    int step  = std::max(1, (int)contour.size() / CONTOUR_SAMPLE_DIVISOR);
+    int extId = 1;
+
+    for (int i = 0; i < (int)contour.size(); i += step)
+    {
+        cv::Point p = contour[i];
+        if (!insideAllowedVerticalBand(p, boneMask.size())) continue;
+        if (nearBorder(p, boneBox)) continue;
+
+        int n    = (int)contour.size();
+        int prev = (i - DIRECTION_OFFSET + n) % n;
+        int next = (i + DIRECTION_OFFSET)     % n;
+        double dc = directionChangeDeg(contour[prev], p, contour[next]);
+
+        cv::Rect roi = safeBox(p, boneMask.size(), EDGE_ROI_RADIUS);
+        int    ec    = cv::countNonZero(edges(roi));
+        double ed    = (double)ec / roi.area();
+
+        if (!validExternalFracture(dc, ec, ed)) continue;
+
+        Fracture f;
+        f.regionId       = extId++;
+        f.method         = "EXTERNAL";
+        f.location       = p;
+        f.score          = dc + ec + ed * 1000.0;
+        f.directionChange= dc;
+        f.box            = fractureBox(p, boneMask.size());
+        candidates.push_back(f);
+    }
+
+    std::sort(candidates.begin(), candidates.end(),
+        [](const Fracture& a, const Fracture& b)
+        { return a.score > b.score; });
+
+    std::vector<Fracture> fractures;
+    for (const auto& c : candidates)
+    {
+        bool tooClose = false;
+        for (const auto& f : fractures)
+            if (cv::norm(c.location - f.location) <
+                EXTERNAL_MIN_DISTANCE_BETWEEN_FRACTURES)
+                { tooClose = true; break; }
+        if (!tooClose) fractures.push_back(c);
+        if ((int)fractures.size() >= MAX_FRACTURES_TO_SHOW) break;
+    }
+    return fractures;
+}
+
+// ============================================================================
+// DRAWING + DEBUG
+// ============================================================================
+
+void drawRegionNumber(cv::Mat& img, int id, const cv::Point& pos,
+                      const cv::Scalar& col, double sc, int th)
+{
+    cv::putText(img, std::to_string(id), pos,
+                cv::FONT_HERSHEY_SIMPLEX, sc, col, th);
+}
+
+void drawSingleFracture(cv::Mat& img, const Fracture& f,
+                        const cv::Scalar& col, int th)
+{
+    cv::rectangle(img, f.box, col, th);
+    cv::circle(img, f.location, 4, col, -1);
+    std::string label = f.method + " #" + std::to_string(f.regionId);
+    cv::putText(img, label,
+                cv::Point(f.box.x, std::max(15, f.box.y - 5)),
+                cv::FONT_HERSHEY_SIMPLEX, 0.55, col, 2);
+}
+
+void drawFractures(cv::Mat& img, const std::vector<Fracture>& fs,
+                   const cv::Scalar& col, int th)
+{
+    for (const auto& f : fs) drawSingleFracture(img, f, col, th);
+}
+
+void drawGroundTruthBoxes(cv::Mat& img,
+                          const std::vector<GroundTruthBox>& gts,
+                          const cv::Scalar& col, int th)
+{
+    for (const auto& gt : gts)
+    {
+        cv::rectangle(img, gt.box, col, th);
+        std::string label = "GT";
+        if (gt.classId >= 0)
+            label += " #" + std::to_string(gt.classId);
+        cv::putText(img, label,
+                    cv::Point(gt.box.x, std::max(15, gt.box.y - 5)),
+                    cv::FONT_HERSHEY_SIMPLEX, 0.55, col, 2);
+    }
+}
+
+cv::Mat drawInternalDebugImage(const cv::Mat& grayEnhanced,
+                               const cv::Mat& boneMask,
+                               const cv::Mat& innerBoneMask,
+                               const std::vector<InternalGradientDebug>& dbInfos)
+{
+    cv::Mat dbImg;
+    cv::cvtColor(grayEnhanced, dbImg, cv::COLOR_GRAY2BGR);
+
+    auto oc = largestContour(boneMask);
+    if (!oc.empty())
+    {
+        std::vector<std::vector<cv::Point>> cs = {oc};
+        cv::drawContours(dbImg, cs, 0, cv::Scalar(0, 255, 0), 2);
+    }
+    auto ic = largestContour(innerBoneMask);
+    if (!ic.empty())
+    {
+        std::vector<std::vector<cv::Point>> cs = {ic};
+        cv::drawContours(dbImg, cs, 0, cv::Scalar(255, 0, 0), 1);
+    }
+
+    for (size_t i = 0; i < dbInfos.size(); ++i)
+    {
+        const auto& info = dbInfos[i];
+        if (info.possibleFracture)
+        {
+            cv::rectangle(dbImg, info.roi, cv::Scalar(0, 255, 255), 2);
+            cv::circle(dbImg, info.center, 4, cv::Scalar(0, 0, 255), -1);
+            // NEW: mostra fused score nella label
+            std::string lbl = "#" + std::to_string(info.id)
+                + " f=" + std::to_string(info.fusedScore).substr(0, 4);
+            cv::putText(dbImg, lbl,
+                        cv::Point(info.roi.x, std::max(15, info.roi.y - 5)),
+                        cv::FONT_HERSHEY_SIMPLEX, 0.5,
+                        cv::Scalar(0, 255, 255), 2);
+        }
+        else if ((int)i % DEBUG_DRAW_EVERY == 0)
+        {
+            cv::rectangle(dbImg, info.roi, cv::Scalar(255, 255, 0), 1);
+            drawRegionNumber(dbImg, info.id,
+                             cv::Point(info.roi.x, std::max(15, info.roi.y - 5)),
+                             cv::Scalar(255, 255, 0), 0.45, 1);
+        }
+    }
+    return dbImg;
+}
+
+cv::Mat drawInternalGradientDebugImage(
+    const cv::Mat& internalGradient,
+    const std::vector<InternalGradientDebug>& dbInfos)
+{
+    cv::Mat grad8 = normalizeFloatForDisplay(internalGradient);
+    cv::Mat dbImg;
+    cv::cvtColor(grad8, dbImg, cv::COLOR_GRAY2BGR);
+
+    for (size_t i = 0; i < dbInfos.size(); ++i)
+    {
+        const auto& info = dbInfos[i];
+        if (info.possibleFracture)
+        {
+            cv::rectangle(dbImg, info.roi, cv::Scalar(0, 255, 255), 2);
+            cv::circle(dbImg, info.center, 4, cv::Scalar(0, 0, 255), -1);
+            drawRegionNumber(dbImg, info.id,
+                             cv::Point(info.roi.x, std::max(15, info.roi.y - 5)),
+                             cv::Scalar(0, 255, 255), 0.55, 2);
+        }
+        else if ((int)i % DEBUG_DRAW_EVERY == 0)
+        {
+            cv::rectangle(dbImg, info.roi, cv::Scalar(255, 255, 0), 1);
+            drawRegionNumber(dbImg, info.id,
+                             cv::Point(info.roi.x, std::max(15, info.roi.y - 5)),
+                             cv::Scalar(255, 255, 0), 0.45, 1);
+        }
+    }
+    return dbImg;
+}
+
+std::vector<Fracture> mergeAllFractures(const std::vector<Fracture>& internal,
+                                        const std::vector<Fracture>& external)
+{
+    std::vector<Fracture> all(internal);
+    all.insert(all.end(), external.begin(), external.end());
+    std::sort(all.begin(), all.end(),
+        [](const Fracture& a, const Fracture& b)
+        { return a.score > b.score; });
+    if ((int)all.size() > MAX_FRACTURES_TO_SHOW)
+        all.resize(MAX_FRACTURES_TO_SHOW);
+    return all;
+}
+
+// ============================================================================
+// IoU / GROUND TRUTH (invariato)
+// ============================================================================
+
+std::string getFileNameWithoutExtension(const std::string& path)
+{
+    size_t sp = path.find_last_of("\\/");
+    std::string fn = (sp == std::string::npos) ? path : path.substr(sp + 1);
+    size_t dp = fn.find_last_of('.');
+    return dp == std::string::npos ? fn : fn.substr(0, dp);
+}
+
+std::string buildLabelPathFromImagePath(const std::string& imgPath)
+{
+    return LABELS_DIR + "/" + getFileNameWithoutExtension(imgPath) + ".txt";
+}
+
+cv::Rect clampRectToImage(const cv::Rect& r, const cv::Size& sz)
+{
+    int x1 = clampInt(r.x, 0, sz.width  - 1);
+    int y1 = clampInt(r.y, 0, sz.height - 1);
+    int x2 = clampInt(r.x + r.width,  0, sz.width);
+    int y2 = clampInt(r.y + r.height, 0, sz.height);
+    return cv::Rect(x1, y1, std::max(1, x2 - x1), std::max(1, y2 - y1));
+}
+
+bool allBoxValuesLookNormalized(double x, double y,
+                                double w, double h)
+{
+    return x >= 0 && x <= 1 && y >= 0 && y <= 1 &&
+           w >  0 && w <= 1 && h >  0 && h <= 1;
+}
+
+cv::Rect yoloNormalizedToRect(double xc, double yc,
+                               double w,  double h,
+                               const cv::Size& sz)
+{
+    double bw = w * sz.width, bh = h * sz.height;
+    cv::Rect r(
+        (int)std::round(xc * sz.width  - bw / 2),
+        (int)std::round(yc * sz.height - bh / 2),
+        (int)std::round(bw),
+        (int)std::round(bh));
+    return clampRectToImage(r, sz);
+}
+
+cv::Rect pixelXywhToRect(double x, double y,
+                          double w, double h,
+                          const cv::Size& sz)
+{
+    return clampRectToImage(
+        cv::Rect((int)std::round(x), (int)std::round(y),
+                 (int)std::round(w), (int)std::round(h)), sz);
+}
+
+std::vector<double> parseNumbersFromLine(const std::string& line)
+{
+    std::vector<double> v;
+    std::stringstream ss(line);
+    double val;
+    while (ss >> val) v.push_back(val);
+    return v;
+}
+
+std::vector<GroundTruthBox> loadGroundTruthBoxes(
+    const std::string& imgPath, const cv::Size& sz)
+{
+    std::vector<GroundTruthBox> gts;
+    std::ifstream file(buildLabelPathFromImagePath(imgPath).c_str());
+    if (!file.is_open())
+    {
+        std::cout << "\nATTENZIONE: file etichetta non trovato.\n"
+                  << "La valutazione IoU non verra calcolata.\n";
+        return gts;
+    }
+
+    std::string line;
+    int lineNum = 0, ignoredNotClass3 = 0;
+    while (std::getline(file, line))
+    {
+        ++lineNum;
+        if (line.empty() || line[0] == '#') continue;
+        auto vals = parseNumbersFromLine(line);
+        if (vals.size() != 5)
+        {
+            std::cout << "Riga ignorata " << lineNum << "\n";
+            continue;
+        }
+        int classId = (int)std::round(vals[0]);
+        if (classId != 3) { ++ignoredNotClass3; continue; }
+
+        double x = vals[1], y = vals[2], w = vals[3], h = vals[4];
+        if (w <= 0 || h <= 0) continue;
+
+        cv::Rect box = allBoxValuesLookNormalized(x, y, w, h)
+            ? yoloNormalizedToRect(x, y, w, h, sz)
+            : pixelXywhToRect(x, y, w, h, sz);
+
+        GroundTruthBox gt;
+        gt.classId = classId;
+        gt.box     = box;
+        gts.push_back(gt);
+    }
+    std::cout << "\nFile etichetta: " << buildLabelPathFromImagePath(imgPath)
+              << "\nGround truth classe 3: " << gts.size()
+              << "\nRighe ignorate (non classe 3): " << ignoredNotClass3 << "\n";
+    return gts;
+}
+
+double computeIntersectionArea(const cv::Rect& a, const cv::Rect& b)
+{
+    int xL = std::max(a.x, b.x);
+    int yT = std::max(a.y, b.y);
+    int xR = std::min(a.x + a.width,  b.x + b.width);
+    int yB = std::min(a.y + a.height, b.y + b.height);
+    return (double)std::max(0, xR - xL) * std::max(0, yB - yT);
+}
+
+double computeIoU(const cv::Rect& a, const cv::Rect& b)
+{
+    double inter = computeIntersectionArea(a, b);
+    double uniAB = (double)a.area() + (double)b.area() - inter;
+    return uniAB > 0 ? inter / uniAB : 0.0;
+}
+
+IoUEvaluation evaluateDetectionsWithIoU(
+    const std::vector<Fracture>& dets,
+    std::vector<GroundTruthBox>& gts,
+    double thr)
+{
+    IoUEvaluation eval;
+    for (auto& gt : gts) gt.matched = false;
+
+    auto sorted = dets;
+    std::sort(sorted.begin(), sorted.end(),
+        [](const Fracture& a, const Fracture& b)
+        { return a.score > b.score; });
+
+    for (const auto& det : sorted)
+    {
+        double bestIoU = 0, bestIA = 0;
+        int    bestIdx = -1;
+        for (size_t j = 0; j < gts.size(); ++j)
+        {
+            if (gts[j].matched) continue;
+            double iou = computeIoU(det.box, gts[j].box);
+            double ia  = computeIntersectionArea(det.box, gts[j].box);
+            if (iou > bestIoU ||
+                (std::abs(iou - bestIoU) < 1e-9 && ia > bestIA))
+                { bestIoU = iou; bestIA = ia; bestIdx = (int)j; }
+        }
+        if (bestIdx >= 0 && bestIoU >= thr)
+        {
+            gts[bestIdx].matched = true;
+            eval.truePositive++;
+            std::cout << "TP | " << det.method << " #" << det.regionId
+                      << " | IoU=" << bestIoU << "\n";
+        }
+        else
+        {
+            eval.falsePositive++;
+            std::cout << "FP | " << det.method << " #" << det.regionId
+                      << " | bestIoU=" << bestIoU << "\n";
+        }
+    }
+    for (const auto& gt : gts)
+        if (!gt.matched)
+        {
+            eval.falseNegative++;
+            std::cout << "FN | " << gt.box << "\n";
+        }
+
+    eval.precision = (eval.truePositive + eval.falsePositive) > 0
+        ? (double)eval.truePositive /
+          (eval.truePositive + eval.falsePositive) : 0;
+    eval.recall    = (eval.truePositive + eval.falseNegative) > 0
+        ? (double)eval.truePositive /
+          (eval.truePositive + eval.falseNegative) : 0;
+    eval.f1        = (eval.precision + eval.recall) > 0
+        ? 2 * eval.precision * eval.recall /
+          (eval.precision + eval.recall) : 0;
+    return eval;
+}
+
+// ============================================================================
+// PRINT + SAVE
+// ============================================================================
+
+void printAdaptiveThresholds(const InternalAdaptiveThresholds& t)
+{
+    std::cout << "\n--- Soglie interne adattive ---\n"
+              << "meanGray        >= " << t.meanGray           << "\n"
+              << "meanGrad        >= " << t.meanGradient        << "\n"
+              << "stdGrad         >= " << t.stdGradient         << "\n"
+              << "maxGrad         >= " << t.maxGradient         << "\n"
+              << "stdGray         >= " << t.stdGray             << "\n"
+              << "darkDiff        >= " << t.darkDifference      << "\n"
+              << "fusedScore      >= " << t.fusedScoreThreshold << " [NEW]\n"
+              << "minTestForti    >= " << INTERNAL_MIN_STRONG_TESTS << "\n";
+}
+
+void printFinalFractures(const std::vector<Fracture>& fs,
+                         const std::string& title)
+{
+    std::cout << "\n--- " << title << " ---\n";
+    for (const auto& f : fs)
+    {
+        std::cout << "Metodo: " << f.method
+                  << " | ROI #" << f.regionId
+                  << " | centro: " << f.location
+                  << " | score: "  << f.score;
+        if (f.method == "EXTERNAL")
+            std::cout << " | cambio dir: " << f.directionChange;
+        std::cout << "\n";
+    }
+    std::cout << "Numero fratture: " << fs.size() << "\n";
+}
+
+void printIoUEvaluation(const IoUEvaluation& eval)
+{
+    std::cout << "\n--- Valutazione IoU ---\n"
+              << "Soglia: "    << IOU_THRESHOLD      << "\n"
+              << "TP="         << eval.truePositive
+              << " FP="        << eval.falsePositive
+              << " FN="        << eval.falseNegative  << "\n"
+              << "Precision="  << eval.precision
+              << " Recall="    << eval.recall
+              << " F1="        << eval.f1             << "\n";
+}
+
+void saveEachFractureOnSeparateImage(const cv::Mat& baseGray,
+                                     const std::vector<Fracture>& fs)
+{
+    for (size_t i = 0; i < fs.size(); ++i)
+    {
+        const auto& f = fs[i];
+        cv::Mat out;
+        cv::cvtColor(baseGray, out, cv::COLOR_GRAY2BGR);
+        cv::Scalar col = (f.method == "INTERNAL")
+            ? cv::Scalar(0, 255, 255) : cv::Scalar(0, 0, 255);
+        drawSingleFracture(out, f, col, 3);
+        char buf[256];
+        std::snprintf(buf, sizeof(buf), "%s%03d_%s_roi_%d.png",
+                      OUTPUT_PREFIX.c_str(), (int)i + 1,
+                      f.method.c_str(), f.regionId);
+        cv::imwrite(buf, out);
+    }
+}
+
+// ============================================================================
+// MAIN
+// ============================================================================
+
+int main()
+{
+    std::string imagePath;
+    std::cout << "Inserisci il percorso dell'immagine: ";
+    std::getline(std::cin, imagePath);
+
+    int bitsUsed = 0;
+    cv::Mat img = ucas::imread(imagePath,
+                               cv::IMREAD_UNCHANGED, &bitsUsed);
+    if (img.empty())
+        UCAS_THROW(ucas::strprintf("Impossibile aprire: %s",
+                                   imagePath.c_str()));
+
+    cv::Mat gray = improveImage(img, bitsUsed);
+
+    // ── Stage 1: Segmentazione ossea ─────────────────────────────────────────
+    cv::Mat boneMask, edges;
+    computeSegmentation(gray, boneMask, edges);
+
+    // display enhanced
+    cv::Mat grayEnhanced = enhanceGrayForDisplay(gray, boneMask);
+
+    // ── Rilevamento fratture esterne (invariato) ──────────────────────────────
+    std::vector<Fracture> externalFractures =
+        detectExternalFractures(boneMask, edges);
+
+    // ── Rilevamento fratture interne (pipeline arricchita) ────────────────────
+    cv::Mat innerBoneMask, internalGradient;
+    std::vector<InternalGradientDebug> debugInfos;
+    InternalAdaptiveThresholds adaptiveThresholds;
+
+    std::vector<Fracture> internalFractures =
+        detectInternalFracturesByGradientAndGray(
+            grayEnhanced, boneMask,
+            innerBoneMask, internalGradient,
+            debugInfos, adaptiveThresholds);
+
+    // ── Merge ─────────────────────────────────────────────────────────────────
+    std::vector<Fracture> allFractures =
+        mergeAllFractures(internalFractures, externalFractures);
+
+    printAdaptiveThresholds(adaptiveThresholds);
+    printFinalFractures(internalFractures, "Fratture interne");
+    printFinalFractures(externalFractures, "Fratture esterne");
+    printFinalFractures(allFractures,      "Tutte le possibili fratture");
+
+    // ── Valutazione IoU ───────────────────────────────────────────────────────
+    std::vector<GroundTruthBox> groundTruths =
+        loadGroundTruthBoxes(imagePath, grayEnhanced.size());
+    if (!groundTruths.empty())
+    {
+        IoUEvaluation eval =
+            evaluateDetectionsWithIoU(allFractures,
+                                      groundTruths, IOU_THRESHOLD);
+        printIoUEvaluation(eval);
+    }
+
+    // ── Rendering ─────────────────────────────────────────────────────────────
+    cv::Mat result;
+    cv::cvtColor(grayEnhanced, result, cv::COLOR_GRAY2BGR);
+    drawFractures(result, internalFractures, cv::Scalar(0, 255, 255), 3);
+    drawFractures(result, externalFractures, cv::Scalar(0, 0,   255), 3);
+    drawGroundTruthBoxes(result, groundTruths, cv::Scalar(255, 0, 255), 2);
+
+    cv::Mat debugOnGray =
+        drawInternalDebugImage(grayEnhanced, boneMask,
+                               innerBoneMask, debugInfos);
+    cv::Mat debugOnGradient =
+        drawInternalGradientDebugImage(internalGradient, debugInfos);
+    cv::Mat internalGradientDisplay =
+        normalizeFloatForDisplay(internalGradient);
+
+    saveEachFractureOnSeparateImage(grayEnhanced, allFractures);
+
+    // ── Salvataggio immagini di output ────────────────────────────────────────
+    cv::imwrite("result_all_fractures.png",       result);
+    cv::imwrite("bone_mask.png",                  boneMask);
+    cv::imwrite("inner_bone_mask.png",            innerBoneMask);
+    cv::imwrite("internal_gradient.png",          internalGradientDisplay);
+    cv::imwrite("debug_internal_on_gray.png",     debugOnGray);
+    cv::imwrite("debug_internal_on_gradient.png", debugOnGradient);
+
+    // NEW: salva mappe delle singole feature per debugging
+    cv::Mat mg = computeMorphologicalGradient(grayEnhanced, innerBoneMask);
+    cv::Mat th = computeTopHatMultiOrientation(grayEnhanced, innerBoneMask);
+    cv::Mat gb = computeGaborBank(grayEnhanced, innerBoneMask);
+    cv::Mat gl = computeLocalGLCMContrast(grayEnhanced, innerBoneMask);
+    cv::Mat fu = computeFusedMap(mg, th, gb, gl, innerBoneMask);
+
+    cv::imwrite("map_morph_gradient.png", normalizeFloatForDisplay(mg));
+    cv::imwrite("map_tophat.png",         normalizeFloatForDisplay(th));
+    cv::imwrite("map_gabor.png",          normalizeFloatForDisplay(gb));
+    cv::imwrite("map_glcm.png",           normalizeFloatForDisplay(gl));
+    cv::imwrite("map_fused.png",          normalizeFloatForDisplay(fu));
+
+    // ── Visualizzazione interattiva ───────────────────────────────────────────
+    ucas::imshow("Scala di grigi originale",         gray,                   false);
+    ucas::imshow("Scala di grigi enfatizzata",        grayEnhanced,           false);
+    ucas::imshow("Bone mask",                        boneMask,               false);
+    ucas::imshow("Maschera interna osso",            innerBoneMask,          false);
+    ucas::imshow("Gradiente Sobel interno",          internalGradientDisplay,false);
+    ucas::imshow("Mappa Morph. Gradient [2A]",       normalizeFloatForDisplay(mg), false);
+    ucas::imshow("Mappa Top-hat multi-or. [2B]",     normalizeFloatForDisplay(th), false);
+    ucas::imshow("Mappa Gabor Bank [2C]",            normalizeFloatForDisplay(gb), false);
+    ucas::imshow("Mappa GLCM Contrast [2D]",         normalizeFloatForDisplay(gl), false);
+    ucas::imshow("Fused Map [Stage 3]",              normalizeFloatForDisplay(fu), false);
+    ucas::imshow("ROI interne su scala di grigi",    debugOnGray,            false);
+    ucas::imshow("ROI interne sul gradiente",        debugOnGradient,        false);
+    ucas::imshow("Tutte le fratture + ground truth", result,                 true);
+
+    cv::destroyAllWindows();
+    return EXIT_SUCCESS;
+}
