@@ -21,9 +21,9 @@ Regola TP (modalita' NMS-only):
     una detection combacia con una GT se IoU >= 0.50; se piu' detection
     combaciano con la stessa GT, la TP e' quella con ML score piu' alto
     (NON quella con IoU migliore). Una detection non-TP che si sovrappone
-    alla TP (IoU fra le due ROI >= ignore_iou, default 0.30) e che ha IoU
-    con la GT inferiore a quella della TP viene IGNORATA (duplicato: non
-    conta come FP). Ogni altra detection e' FP.
+    alla stessa GROUND TRUTH gia' trovata (IoU con la GT >= ignore_iou,
+    default 0.30) e che ha IoU con la GT inferiore a quella della TP viene
+    IGNORATA (duplicato: non conta come FP). Ogni altra detection e' FP.
 
 Uso tipico dalla root del progetto:
     python evaluate_test_postprocess.py --labels "/percorso/alle/labels" --no-show-plots
@@ -445,11 +445,11 @@ def _canonical_technique(name: Any) -> str:
 
 
 
-# IGNORE duplicati: una detection non-TP che si sovrappone alla TP della sua GT
-# (IoU fra le due ROI >= ignore_iou) e con IoU sulla GT inferiore a quella della
-# TP viene marcata IGNORE (non conta come FP). E' la regola "duplicato vicino a
-# una TP gia' trovata": fra due ROI che si intersecano si ignora quella con IoU
-# piu' basso sulla GT.
+# IGNORE duplicati: una detection non-TP che si sovrappone alla GROUND TRUTH gia'
+# trovata (IoU con la GT >= ignore_iou) e con IoU sulla GT inferiore a quella della
+# TP viene marcata IGNORE (non conta come FP). E' la regola "duplicato sulla stessa
+# frattura gia' trovata": fra due ROI che insistono sulla stessa GT si ignora quella
+# con IoU piu' basso sulla GT.
 
 
 def _evaluate_local(detections: List[Dict[str, Any]], gt_boxes: List[Dict[str, Any]], tp_iou: float, ignore_iou: float) -> Dict[str, Any]:
@@ -472,7 +472,7 @@ def _evaluate_local(detections: List[Dict[str, Any]], gt_boxes: List[Dict[str, A
     # Tra le detection che combaciano con la stessa GT (IoU >= tp_iou) la TP e'
     # quella con ML score piu' alto, NON quella con IoU migliore.
     tp = 0
-    tp_dets: List[Dict[str, Any]] = []
+    tp_by_gi: Dict[int, Dict[str, Any]] = {}
     for gi, g in enumerate(gt):
         contenders = [d for d in dets if d.get("_tp_gt") == gi]
         if not contenders:
@@ -487,25 +487,23 @@ def _evaluate_local(detections: List[Dict[str, Any]], gt_boxes: List[Dict[str, A
         winner["post_label"] = "TP"
         g["matched"] = True
         tp += 1
-        tp_dets.append(winner)
+        tp_by_gi[gi] = winner
 
-    # IGNORE: una detection non-TP che si sovrappone a una TP gia' trovata
-    # (IoU fra le due ROI >= ignore_iou) e che ha IoU con la GT inferiore (o uguale)
-    # a quella della TP viene IGNORATA (duplicato), quindi NON conta come FP. Ogni
-    # altra detection non-TP resta un FP.
+    # IGNORE: una detection non-TP che si sovrappone alla GROUND TRUTH gia' trovata
+    # (IoU con la GT >= ignore_iou) con IoU sulla GT inferiore (o uguale) a quella
+    # della TP viene IGNORATA (duplicato sulla stessa frattura), quindi NON conta
+    # come FP. Ogni altra detection non-TP resta un FP.
     for det in dets:
         if det.get("post_label") == "TP":
             continue
+        gi = det.get("_best_gt")
         det_gt_iou = _safe_float(det.get("best_gt_iou", 0.0))
-        kept = None
-        for tp_det in tp_dets:
-            if _iou(det, tp_det) >= ignore_iou and det_gt_iou <= _safe_float(tp_det.get("best_gt_iou", 0.0)):
-                kept = tp_det
-                break
-        if kept is not None:
+        tp_det = tp_by_gi.get(gi) if gi is not None else None
+        if (tp_det is not None and det_gt_iou >= ignore_iou
+                and det_gt_iou <= _safe_float(tp_det.get("best_gt_iou", 0.0))):
             det["post_label"] = "IGNORE"
-            det["ignore_reason"] = "overlap_ge_ignore_iou_with_tp_lower_gt_iou"
-            det["duplicate_kept_roi_id"] = str(kept.get("roi_id", ""))
+            det["ignore_reason"] = "overlap_ge_ignore_iou_with_found_gt"
+            det["duplicate_kept_roi_id"] = str(tp_det.get("roi_id", ""))
         else:
             det["post_label"] = "FP"
             det["ignore_reason"] = ""
@@ -693,10 +691,10 @@ def _ap_match_image_detections(
 
     # Step 2 delle formule: per ogni GT i finding con IoU >= soglia sono candidati.
     # Vince (TP) quello con ML/confidence score maggiore. Una detection non-TP che
-    # si sovrappone alla TP (IoU fra le due ROI >= duplicate_iou) e con IoU sulla GT
-    # inferiore (o uguale) a quella della TP viene marcata IGNORE ed esclusa dalla
-    # lista TP/FP dell'AP (duplicato). Ogni altra detection non-TP e' un FP.
-    tp_dets: List[Dict[str, Any]] = []
+    # si sovrappone alla GROUND TRUTH gia' trovata (IoU con la GT >= duplicate_iou) e
+    # con IoU sulla GT inferiore (o uguale) a quella della TP viene marcata IGNORE ed
+    # esclusa dalla lista TP/FP dell'AP (duplicato). Ogni altra detection non-TP e' un FP.
+    tp_by_gi: Dict[int, Dict[str, Any]] = {}
     for gi, _g in enumerate(gt):
         contenders = [d for d in dets if _iou(d, gt[gi]) >= float(tp_iou)]
         if not contenders:
@@ -705,20 +703,18 @@ def _ap_match_image_detections(
         if winner.get("_ap_label") is None:
             winner["_ap_label"] = "TP"
             winner["_ap_reason"] = "matched_gt_highest_confidence"
-            tp_dets.append(winner)
+            tp_by_gi[gi] = winner
 
     for d in dets:
         if d.get("_ap_label") == "TP":
             continue
+        gi = d.get("_best_gt")
         d_gt_iou = _safe_float(d.get("best_gt_iou", 0.0))
-        kept = None
-        for tp_det in tp_dets:
-            if _iou(d, tp_det) >= float(duplicate_iou) and d_gt_iou <= _safe_float(tp_det.get("best_gt_iou", 0.0)):
-                kept = tp_det
-                break
-        if kept is not None:
+        tp_det = tp_by_gi.get(gi) if gi is not None else None
+        if (tp_det is not None and d_gt_iou >= float(duplicate_iou)
+                and d_gt_iou <= _safe_float(tp_det.get("best_gt_iou", 0.0))):
             d["_ap_label"] = "IGNORE"
-            d["_ap_reason"] = "overlap_ge_ignore_iou_with_tp_lower_gt_iou"
+            d["_ap_reason"] = "overlap_ge_ignore_iou_with_found_gt"
         else:
             d["_ap_label"] = "FP"
             d["_ap_reason"] = "no_gt_match_or_lower_confidence_on_same_gt"
@@ -1356,7 +1352,7 @@ def main() -> int:
     parser.add_argument("--curves-dir", default=str(DEFAULT_CURVES_DIR), help="Cartella output curve")
     parser.add_argument("--gt-class", type=int, default=3, help="Classe YOLO frattura")
     parser.add_argument("--match-iou", type=float, default=0.50, help="TP se IoU >= match_iou")
-    parser.add_argument("--ignore-iou", type=float, default=0.30, help="IGNORE duplicati: una detection non-TP che si sovrappone alla TP (IoU fra le due ROI >= ignore_iou) e con IoU sulla GT inferiore a quella della TP non conta come FP")
+    parser.add_argument("--ignore-iou", type=float, default=0.30, help="IGNORE duplicati: una detection non-TP che si sovrappone alla GT gia' trovata (IoU con la GT >= ignore_iou) e con IoU sulla GT inferiore a quella della TP non conta come FP")
     parser.add_argument("--nms-iou", type=float, default=0.50, help="IoU NMS")
     parser.add_argument("--nms-sweep", default="0.30,0.40,0.50", help="Soglie NMS confrontate AUTOMATICAMENTE sulla validation (default '0.30,0.40,0.50'): sceglie il vincitore per F1 (salvaguardia recall) e lo usa per la valutazione del test. Metti '' per disattivare.")
     parser.add_argument("--validation-manifest", default=str(DEFAULT_VAL_MANIFEST), help="Manifest del set di validation per lo sweep NMS automatico.")
