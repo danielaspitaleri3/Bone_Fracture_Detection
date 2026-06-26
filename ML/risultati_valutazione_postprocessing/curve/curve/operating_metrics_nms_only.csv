@@ -1,0 +1,2 @@
+technique,technique_label,threshold,TP,FP,FN,IGNORED,GT,detections,precision,recall,sensitivity,F1,F2,fp_per_image
+nms,NMS,0.5,201,182,49,22,250,405,0.5248041775456919,0.804,0.804,0.6350710900473935,0.7266811279826465,0.7551867219917012
