@@ -324,10 +324,10 @@ TECHNIQUE_LABELS = {
 }
 DEFAULT_POSTPROCESS_TECHNIQUE = NMS_TECHNIQUE
 
-NMS_IOU_THRESHOLD = 0.40        # NMS: scarta come duplicato solo box con IoU >= 0.40
+NMS_IOU_THRESHOLD = 0.50        # NMS: scarta come duplicato solo box con IoU >= 50%
 TP_IOU_THRESHOLD = 0.50         # REGOLA FISSA: una detection e' TP se best IoU >= 0.50
 TP_IOU_RULE_TEXT = f"IoU >= {TP_IOU_THRESHOLD:.2f}"
-IGNORE_IOU_THRESHOLD = 0.20     # IGNORE: duplicato solo se IoU GT >= 0.20 su una GT che ha GIA' un TP
+IGNORE_IOU_THRESHOLD = 0.30     # IGNORE: duplicato solo se IoU GT >= 0.30 su una GT che ha GIA' un TP
 ML_MIN_SCORE = 0.50             # soglia ML operativa: ROI considerata se ML >= 0.50
 
 
@@ -358,17 +358,8 @@ _best_postprocess_params = _load_best_postprocess_params()
 if _best_postprocess_params:
     try:
         ML_MIN_SCORE = 0.50
-        json_nms_iou = _best_postprocess_params.get("nms_iou")
-        if json_nms_iou is not None:
-            try:
-                json_nms_iou = float(json_nms_iou)
-                if abs(json_nms_iou - NMS_IOU_THRESHOLD) > 1e-12:
-                    print(
-                        f"[INFO] nms_iou={json_nms_iou:.3f} nel JSON ignorato: "
-                        f"la GUI usa sempre NMS con IoU >= {NMS_IOU_THRESHOLD:.2f}."
-                    )
-            except Exception:
-                pass
+        if _best_postprocess_params.get("nms_iou") is not None:
+            NMS_IOU_THRESHOLD = float(_best_postprocess_params.get("nms_iou", NMS_IOU_THRESHOLD))
         json_tp_iou = _best_postprocess_params.get("tp_iou")
         if json_tp_iou is not None:
             try:
@@ -380,11 +371,12 @@ if _best_postprocess_params:
                     )
             except Exception:
                 pass
-        IGNORE_IOU_THRESHOLD = 0.20
+        if _best_postprocess_params.get("ignore_iou") is not None:
+            IGNORE_IOU_THRESHOLD = float(_best_postprocess_params.get("ignore_iou", IGNORE_IOU_THRESHOLD))
         DEFAULT_POSTPROCESS_TECHNIQUE = NMS_TECHNIQUE
         print(
             "[INFO] Parametri NMS caricati: "
-            f"ML>={ML_MIN_SCORE:.3f}, NMS IoU>={NMS_IOU_THRESHOLD:.3f}, "
+            f"ML>={ML_MIN_SCORE:.3f}, NMS IoU={NMS_IOU_THRESHOLD:.3f}, "
             f"TP>={TP_IOU_THRESHOLD:.2f}"
         )
     except Exception as exc:
@@ -402,24 +394,16 @@ def _refresh_best_postprocess_params(verbose=False):
         return None
     try:
         ML_MIN_SCORE = 0.50
-        json_nms_iou = data.get("nms_iou")
-        if json_nms_iou is not None:
-            try:
-                json_nms_iou = float(json_nms_iou)
-                if abs(json_nms_iou - NMS_IOU_THRESHOLD) > 1e-12 and verbose:
-                    print(
-                        f"[INFO] nms_iou={json_nms_iou:.3f} nel JSON ignorato: "
-                        f"la GUI usa sempre NMS con IoU >= {NMS_IOU_THRESHOLD:.2f}."
-                    )
-            except Exception:
-                pass
-        IGNORE_IOU_THRESHOLD = 0.20
+        if data.get("nms_iou") is not None:
+            NMS_IOU_THRESHOLD = float(data.get("nms_iou", NMS_IOU_THRESHOLD))
+        if data.get("ignore_iou") is not None:
+            IGNORE_IOU_THRESHOLD = float(data.get("ignore_iou", IGNORE_IOU_THRESHOLD))
         DEFAULT_POSTPROCESS_TECHNIQUE = NMS_TECHNIQUE
         _best_postprocess_params = data
         if verbose:
             print(
                 "[INFO] Best NMS test set riletto: "
-                f"ML>={ML_MIN_SCORE:.3f}, NMS IoU>={NMS_IOU_THRESHOLD:.3f}, "
+                f"ML>={ML_MIN_SCORE:.3f}, NMS IoU={NMS_IOU_THRESHOLD:.3f}, "
                 f"TP>={TP_IOU_THRESHOLD:.2f}"
             )
         return data
@@ -444,10 +428,10 @@ def _best_postprocess_params_summary():
         precision = recall = f1 = f2 = ap = 0.0
     metric = str(data.get("selection_metric", "F1"))
     win = data.get("nms_selected")
-    win_txt = f"NMS operativa={float(NMS_IOU_THRESHOLD):.2f} · "
+    win_txt = f"NMS vincente (validation, F1)={float(win):.2f} · " if win else ""
     return (
         f"{win_txt}TEST SET NMS: ML>={ML_MIN_SCORE:.3f} · "
-        f"NMS IoU>={float(NMS_IOU_THRESHOLD):.2f} · "
+        f"NMS IoU={float(data.get('nms_iou', NMS_IOU_THRESHOLD)):.2f} · "
         f"TP IoU>={TP_IOU_THRESHOLD:.2f} · P={precision:.2f}% · R={recall:.2f}% · "
         f"F1={f1:.4f} · F2={f2:.4f} · AP={ap:.4f} · criterio={metric}"
     )
@@ -674,7 +658,7 @@ def _continuous_curve_model(curve_name):
         # Se è stato fatto uno sweep NMS su validation, mostro qual è il vincitore.
         _params = _load_best_postprocess_params() or _best_postprocess_params or {}
         _win = _params.get("nms_selected") if isinstance(_params, dict) else None
-        win_txt = f"NMS operativa: {float(NMS_IOU_THRESHOLD):.2f} · "
+        win_txt = f"NMS vincente (validation, F1): {float(_win):.2f} · " if _win else ""
         footer = (f"{win_txt}FROC NMS · asse Y (sensibilità) in scala logaritmica · FP/img 0-5 · "
                   f"CPM={cpm:.3f} (media dei pallini) · " + _curve_threshold_note())
         return {
@@ -1096,8 +1080,10 @@ def postprocess_ml_rois(
     )
 
 
-# NB: _suppress_overlapping_non_tp_duplicates rimossa con l'ignore: ogni detection
-# non-TP conta come FP, senza piu' la categoria IGNORE.
+# IGNORE ripristinato: una detection non-TP che insiste sulla stessa GROUND TRUTH
+# gia' trovata (IoU con la GT >= IGNORE_IOU_THRESHOLD) con IoU inferiore alla TP e'
+# un duplicato sulla stessa frattura -> marcata IGNORE (non conta come FP e non viene
+# disegnata nel viewer). Richiede la ground truth: vale solo in vista ML REVIEW.
 
 def evaluate_detections(nms_rois, gt_boxes,
                                tp_iou=TP_IOU_THRESHOLD, ignore_iou=IGNORE_IOU_THRESHOLD):
@@ -1129,6 +1115,7 @@ def evaluate_detections(nms_rois, gt_boxes,
         det["_tp_gt"] = best_gi if _is_tp_iou_match(best_iou, tp_iou) else None
     tp = 0
     gt_has_tp = [False] * len(gt_boxes)
+    tp_by_gi = {}
     for gi, gt in enumerate(gt_boxes):
         contenders = [d for d in nms_rois if d.get("_tp_gt") == gi]
         if not contenders:
@@ -1140,15 +1127,28 @@ def evaluate_detections(nms_rois, gt_boxes,
         gt["matched"] = True
         gt_has_tp[gi] = True
         tp += 1
-    # Ignore RIMOSSO: ogni detection che non e' la TP della sua GT conta come FP
-    # (valutazione standard, coerente con il testing).
+        tp_by_gi[gi] = winner
+    # IGNORE: una detection non-TP che si sovrappone alla GROUND TRUTH gia' trovata
+    # (IoU con la GT >= ignore_iou) e con IoU sulla GT inferiore (o uguale) a quella
+    # della TP e' un duplicato sulla stessa frattura: viene marcata IGNORE (non conta
+    # come FP e non viene disegnata). Ogni altra detection non-TP resta un FP.
     for det in nms_rois:
-        if det.get("post_label") != "TP":
+        if det.get("post_label") == "TP":
+            continue
+        gi = det.get("_best_gt")
+        det_gt_iou = float(det.get("best_gt_iou", 0.0) or 0.0)
+        tp_det = tp_by_gi.get(gi) if gi is not None else None
+        if (tp_det is not None and det_gt_iou >= ignore_iou
+                and det_gt_iou <= float(tp_det.get("best_gt_iou", 0.0) or 0.0)):
+            det["post_label"] = "IGNORE"
+            det["ignore_reason"] = "overlap_ge_ignore_iou_with_found_gt"
+            det["duplicate_kept_roi_id"] = str(tp_det.get("roi_id", ""))
+        else:
             det["post_label"] = "FP"
             det["ignore_reason"] = ""
             det["duplicate_kept_roi_id"] = ""
     fp = sum(1 for d in nms_rois if d.get("post_label") == "FP")
-    ignored = 0
+    ignored = sum(1 for d in nms_rois if d.get("post_label") == "IGNORE")
     fn = sum(1 for gt in gt_boxes if not gt.get("matched", False))
     precision = tp / (tp + fp) if (tp + fp) > 0 else 0.0
     recall = tp / (tp + fn) if (tp + fn) > 0 else 0.0
@@ -3521,8 +3521,8 @@ class FractureApp(ctk.CTk):
         best_note = "TEST SET NMS" if technique == best_tech else f"Test set evaluate NMS: {TECHNIQUE_LABELS.get(best_tech, best_tech)}"
         params_text = (
             f"{best_note}\n"
-            f"Parametri operativi: ML>={float(ML_MIN_SCORE):.3f} · "
-            f"NMS IoU>={float(NMS_IOU_THRESHOLD):.3f} · "
+            f"Parametri caricati da evaluate: ML>={float(ML_MIN_SCORE):.3f} · "
+            f"NMS IoU={float(NMS_IOU_THRESHOLD):.3f} · "
             f"TP {TP_IOU_RULE_TEXT}\n"
             f"{_best_postprocess_params_summary()}"
         )
